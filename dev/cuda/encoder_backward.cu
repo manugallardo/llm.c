@@ -2,7 +2,7 @@
 Kernels for the positional encoder forward pass in GPT-2.
 
 Compile example:
-nvcc -O3 --use_fast_math encoder_backward.cu -o encoder_backward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt encoder_backward.cu -o encoder_backward
 
 version 1 is naive port from CPU code to kernel
 parallelizes over B,T,C, uses atomics to add to dwte, dwpe
@@ -75,7 +75,7 @@ __global__ void encoder_backward_kernel2(float* dwte, float* dwpe,
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) { return; } // guard
     int BT = B * T;
-    for (int i = 0; i < B * T; i++) {
+    for (int i = 0; i < BT; i++) {
         int t = i % T;
         int ix = inp[i];
         float dout_btc = dout[i * C + c];
