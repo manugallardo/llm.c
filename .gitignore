@@ -27,3 +27,4 @@ dev/cuda/nccl_all_reduce
 
 # log files
 *.log
+nul
