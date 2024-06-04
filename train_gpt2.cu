@@ -1,155 +1,88 @@
 /*
-GPT-2 Transformer Neural Net trained in raw CUDA
-GPT-2 Transformer Neural Net trained in raw CUDA
-Non-trivial notes to be aware of:
-
-We are being clever in the backward pass to conserve memory.
-In particular, all parameters use a += in the backward pass, so we
-can later do gradient accumulation. But all activations have = instead of +=
-because these are faster (just read, no write). This is okay for all activations
-except for those in the residual stream, where the gradients have to add. We make
-sure that those parts work out ok and that we do a += as necessary. E.g.,
-the layernorms are connected to the residuals so we += in layernorm backward.
-
-In this file we are using Mixed Precision training, so different activations,
-parameters, grads and buffers may be kept at different precisions, to take
-advantage of the fast low-precision hardware in the latest GPUs (bf16/fp16),
-and fp8 (coming soon^TM).
-
-Compile:
-make train_gpt2cu
-
-Example launch using bfloat16 on 1 GPU batch size 8, sample/eval every 200 steps:
-Also we're using TinyStories here for example as it is a bigger dataset
-./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
-
-Example launch using bfloat16 on 4 GPUs, same as above:
-mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
-
-If you'd like to see train_gpt2.cu produce identical results to
-`python train_gpt2.py`, you can run it like this:
-make train_gpt2cu && ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
-make train_gpt2cu PRECISION=FP32 && ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
-This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
--a 1 is "overfit single batch", -x 10 is 10 iterations, and -f 0 disables tf32
+GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string>
-// GPU / CUDA related
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cublasLt.h>
-#include <nvtx3/nvToolsExt.h>
-#include <cuda_profiler_api.h>
-// Multi-GPU related
+#include <string_view>
+#include <sys/stat.h>
+#include <sys/types.h>
+// ----------- CPU utilities -----------
+// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
+// defines: create_dir_if_not_exists, find_max_step
+#include "llmc/utils.h"
+// defines: tokenizer_init, tokenizer_decode, tokenizer_free
+#include "llmc/tokenizer.h"
+// defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
+// defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
+#include "llmc/dataloader.h"
+// defines: manual_seed, normal_ (same as torch.manual_seed and torch.normal)
+#include "llmc/rand.h"
+// defines: sample_softmax, random_f32
+#include "llmc/sampler.h"
+// defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
+#include "llmc/logger.h"
+// defines: get_flops_promised
+#include "llmc/mfu.h"
+// ----------- GPU utilities -----------
+// defines:
+// WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV, cudaCheck, PRECISION_MODE
+// NVTX_RANGE_FN
+#include "llmc/cuda_common.h"
+// defines:
+// Packed128, f128, x128
+// warpReduceSum, warpReduceMax, blockReduce, copy_and_cast_kernel
+#include "llmc/cuda_utils.cuh"
+// defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
+// defines: cublas_compute, cublaslt_handle, cublas_handle
+#include "llmc/cublas_common.h"
+// ----------- Layer implementations in CUDA -----------
+// defines: encoder_forward, encoder_backward
+#include "llmc/encoder.cuh"
+// defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
+#include "llmc/layernorm.cuh"
+// defines: gelu_forward, gelu_backward_inplace
+#include "llmc/gelu.cuh"
+#ifdef ENABLE_CUDNN
+// defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
+#include "llmc/cudnn_att.h"
+#else
+// defines: attention_forward, attention_backward
+#include "llmc/attention.cuh"
+#endif
+// defines: matmul_forward, matmul_backward
+#include "llmc/matmul.cuh"
+// defines: fused_classifier
+#include "llmc/fused_classifier.cuh"
+// defines: adamw_kernel3
+#include "llmc/adamw.cuh"
+// defines: global_norm_squared
+#include "llmc/global_norm.cuh"
+// ----------- Multi-GPU support -----------
 #ifdef MULTI_GPU
 #include <mpi.h>
 #include <nccl.h>
 #endif
-// our own utilities
-// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
-#include "utils.h"
-// defines: tokenizer_init, tokenizer_decode, tokenizer_free
-#include "tokenizer.h"
-// defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
-#include "dataloader.h"
 
 // ----------------------------------------------------------------------------
-// CUDA precision settings
+// global var containing information about the GPU this process is running on
+cudaDeviceProp deviceProp; // fills in common_start()
 
-enum PrecisionMode {
-    PRECISION_FP32,
-    PRECISION_FP16,
-    PRECISION_BF16
-};
+// ----------------------------------------------------------------------------
+// Multi-GPU related
+#ifdef MULTI_GPU
 
-// Specific configurations based on the enabled precision
 #if defined(ENABLE_FP32)
-typedef float floatX;
-#define CUBLAS_LOWP CUDA_R_32F
-#define PRECISION_MODE PRECISION_FP32
-#ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclFloat;
-#endif
-
-// use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
-typedef half floatX;
-#define CUBLAS_LOWP CUDA_R_16F
-#define PRECISION_MODE PRECISION_FP16
-#ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclHalf;
-#endif
-
 #else // Default to bfloat16
-typedef __nv_bfloat16 floatX;
-#define CUBLAS_LOWP CUDA_R_16BF
-#define PRECISION_MODE PRECISION_BF16
-#ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclBfloat16;
 #endif
-#endif
 
-// ----------------------------------------------------------------------------
-// CUDA utils
-
-// Profiler utils
-class NvtxRange {
- public:
-    NvtxRange(const char* s) { nvtxRangePush(s); }
-    NvtxRange(const std::string& base_str, int number) {
-        std::string range_string = base_str + " " + std::to_string(number);
-        nvtxRangePush(range_string.c_str());
-    }
-    ~NvtxRange() { nvtxRangePop(); }
-};
-#define NVTX_RANGE_FN() NvtxRange nvtx_range(__FUNCTION__)
-
-// try to make sure that 2 blocks fit on A100/H100 to maximise latency tolerance
-// this needs to be defines rather than queried to be used for __launch_bounds__
-#if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ >= 900
-#define MAX_1024_THREADS_BLOCKS 2
-#else
-#define MAX_1024_THREADS_BLOCKS 1
-#endif
-
-// WarpSize is not a compile time constant, this allows the compiler to optimize
-#define WARP_SIZE 32U
-
-// cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
-const size_t cublaslt_workspace_size = 32 * 1024 * 1024;
-void* cublaslt_workspace = NULL;
-cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F;
-cublasLtHandle_t cublaslt_handle;
-cublasHandle_t cublas_handle;
-cudaDeviceProp deviceProp;
-
-// convenience macro for calculating grid/block dimensions for kernels
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
-// CUDA error checking
-void cudaCheck(cudaError_t error, const char *file, int line) {
-  if (error != cudaSuccess) {
-    printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, cudaGetErrorString(error));
-    exit(EXIT_FAILURE);
-  }
-};
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
-
-// cuBLAS error checking
-void cublasCheck(cublasStatus_t status, const char *file, int line)
-{
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
-        exit(EXIT_FAILURE);
-    }
-}
-#define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
-
-#ifdef MULTI_GPU
 void nccl_check(ncclResult_t status, const char *file, int line) {
     if (status != ncclSuccess) {
         printf("[NCCL ERROR] at file %s:%d:\n%s\n", file, line, ncclGetErrorString(status));
@@ -168,184 +101,8 @@ void mpi_check(int status, const char *file, int line) {
     }
 }
 #define mpiCheck(err) (mpi_check(err, __FILE__, __LINE__))
-#endif
 
-// older nvcc does not provide __ldcs and __stcs for bfloat16, despite these actually just being unsigned shorts.
-// we need to be careful here to only define our own versions if none already exist, otherwise the compiler will
-// complain.
-// If not, you easily get "no viable overload" (for sm52) and "function already exists" (sm_80)
-#if defined(ENABLE_BF16) && (__CUDACC_VER_MAJOR__ < 12) && !((__CUDA_ARCH__ >= 800) || !defined(__CUDA_ARCH__))
-__device__ floatX __ldcs(const floatX* address) {
-    unsigned short bf = __ldcs(reinterpret_cast<const unsigned short*>(address));
-    return __nv_bfloat16_raw{bf};
-}
-
-__device__ void __stcs(floatX* address, floatX value) {
-    __stcs(reinterpret_cast<unsigned short*>(address), ((__nv_bfloat16_raw)value).x);
-}
-#endif
-
-// warp-level reduction for summing values
-__device__ float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-// warp-level reduction for finding the maximum value
-__device__ float warpReduceMax(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
-    }
-    return val;
-}
-// requires all 32 threads in the warp to be active, but should work for any block size
-// uses non-dynamic shared memory so every call increases shared memory requirements by 128 bytes
-// the fact it's unique shared memory allows us to avoid an extra __syncthreads() call at the end
-// but if called inside a loop, the shared memory will be implicitly reused, so set final_sync to 1
-using reduction_func_t = float (*) (float);
-template<reduction_func_t warp_reduction>
-__device__ float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
-    // two reductions of up to 1024 threads:
-    // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
-    __shared__ float shared_val[WARP_SIZE];
-    const int lane_id = threadIdx.x % WARP_SIZE;
-    const int warp_id = threadIdx.x / WARP_SIZE;
-    const int num_warps = blockDim.x / WARP_SIZE;
-
-    float warp_val = warp_reduction(val);
-    if (lane_id == 0) { shared_val[warp_id] = warp_val; }
-    __syncthreads();
-    warp_val = (lane_id < num_warps) ? shared_val[lane_id] : out_of_bounds;
-    float block_val = warp_reduction(warp_val);
-
-    if (final_sync) {
-        __syncthreads(); // only needed in loops when effectively reusing shared memory etc.
-    }
-    return block_val;
-}
-
-// ----------------------------------------------------------------------------
-// Packed128 data structure, which forces the compiler to use 128-bit loads/stores
-// in GPUs that support (the LDG.128 and STS.128 instructions)
-// This is a bit similar to the use of float4 in the case of 32-bit floats, but
-// supports arbitrary precision.
-
-template<class ElementType>
-struct alignas(16) Packed128 {
-    Packed128() = default;
-    __device__ explicit Packed128(int4 bits) {
-        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
-        memcpy(&payload, &bits, sizeof(bits));
-    }
-    __device__ ElementType& operator[](int index) {
-        return payload[index];
-    }
-    __device__ const ElementType& operator[](int index) const {
-        return payload[index];
-    }
-    __device__ int4 get_bits() const {
-        int4 bits;
-        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
-        memcpy(&bits, &payload, sizeof(bits));
-        return bits;
-    }
-    static constexpr const size_t size = sizeof(int4) / sizeof(ElementType);
-    ElementType payload[size];
-};
-
-// load a Packed128 from an aligned memory address
-template<class ElementType>
-__device__ Packed128<ElementType> load128(const ElementType* address) {
-    return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
-}
-// load a Packed128 from an aligned memory address with streaming cache hint
-template<class ElementType>
-__device__ Packed128<ElementType> load128cs(const ElementType* address) {
-    return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
-}
-// store a Packed128 to an aligned memory address
-template<class ElementType>
-__device__ void store128(ElementType* target, Packed128<ElementType> value) {
-    *reinterpret_cast<int4*>(target) = value.get_bits();
-}
-// store a Packed128 to an aligned memory address with streaming cache hint
-template<class ElementType>
-__device__ void store128cs(ElementType* target, Packed128<ElementType> value) {
-    __stcs(reinterpret_cast<int4*>(target), value.get_bits());
-}
-// store a Packed128 to an aligned memory address while caching in L2 but bypassing L1
-template<class ElementType>
-__device__ void store128cg(ElementType* target, Packed128<ElementType> value) {
-    __stcg(reinterpret_cast<int4*>(target), value.get_bits());
-}
-
-// short-form typedefs
-typedef Packed128<float> f128;
-typedef Packed128<floatX> x128;
-
-// ----------------------------------------------------------------------------
-// Random Number Generatiom
-
-// Simple xorshift RNG
-__device__ __host__ unsigned int random_u32(unsigned long long *state) {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
-}
-__device__ __host__ float random_f32(unsigned long long *state) { // random float32 in [0,1)
-    return (random_u32(state) >> 8) / 16777216.0f;
-}
-
-// SquirrelNoise5 - Squirrel's Raw Noise utilities (version 5)
-// This gives us a random number from threadIdx/blockIdx + a single seed for the entire GPU
-// todo - possibly overkill and we don't need such high quality random numbers? (tbd)
-// http://eiserloh.net/noise/SquirrelNoise5.hpp
-__device__ __host__ constexpr unsigned int SquirrelNoise5(int positionX, unsigned int seed)
-{
-	constexpr unsigned int SQ5_BIT_NOISE1 = 0xd2a80a3f;	// 11010010101010000000101000111111
-	constexpr unsigned int SQ5_BIT_NOISE2 = 0xa884f197;	// 10101000100001001111000110010111
-	constexpr unsigned int SQ5_BIT_NOISE3 = 0x6C736F4B; // 01101100011100110110111101001011
-	constexpr unsigned int SQ5_BIT_NOISE4 = 0xB79F3ABB;	// 10110111100111110011101010111011
-	constexpr unsigned int SQ5_BIT_NOISE5 = 0x1b56c4f5;	// 00011011010101101100010011110101
-	unsigned int mangledBits = (unsigned int) positionX;
-	mangledBits *= SQ5_BIT_NOISE1;
-	mangledBits += seed;
-	mangledBits ^= (mangledBits >> 9);
-	mangledBits += SQ5_BIT_NOISE2;
-	mangledBits ^= (mangledBits >> 11);
-	mangledBits *= SQ5_BIT_NOISE3;
-	mangledBits ^= (mangledBits >> 13);
-	mangledBits += SQ5_BIT_NOISE4;
-	mangledBits ^= (mangledBits >> 15);
-	mangledBits *= SQ5_BIT_NOISE5;
-	mangledBits ^= (mangledBits >> 17);
-	return mangledBits;
-}
-__device__ __host__ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY, unsigned int seed)
-{
-	constexpr int PRIME_NUMBER = 198491317; // Large prime number with non-boring bits
-	return SquirrelNoise5(indexX + (PRIME_NUMBER * indexY), seed);
-}
-
-// stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
-__device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out, unsigned int seed) {
-    // todo - is this stochastic rounding *too good*? can we cut any corners?
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-    unsigned int threshold = random & 0xFFFF;
-    unsigned int float_bits = __float_as_uint(in);
-    unsigned int rounded_bits = float_bits & 0x0000FFFF;
-    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
-    *out = __float2bfloat16_rn(__uint_as_float(float_bits));
-}
-__device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
-    *out = (float)in; // todo - implement this...
-}
-__device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
-    *out = in; // dummy function for when floatX is float (FP32 mode)
-}
+#endif // MULTI_GPU
 
 // ----------------------------------------------------------------------------
 // MPI / multi-processing setup
@@ -447,6 +204,14 @@ void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
 #endif
 }
 
+void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config) {
+#ifdef MULTI_GPU
+    if (multi_gpu_config->num_processes > 1) {
+        mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+    }
+#endif
+}
+
 // convenience function that only prints if the rank of process is zero
 void printf0(const char *format, ...) {
     if (multi_gpu_config.process_rank == 0) {
@@ -483,1218 +248,6 @@ void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t t
         printf0("| Disabling Zero Optimization, Zero Stage2 and Stage3 are not yet supported  |\n");
         multi_gpu_config->zero_stage = 0;
     }
-}
-
-// ----------------------------------------------------------------------------
-// cuDNN path
-#ifdef ENABLE_CUDNN
-// functions defined in cudnn_att.cu
-void create_cudnn();
-void destroy_cudnn();
-void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
-                             float* stats, // output for backward pass: (B, NH, T)
-                             floatX* inp,  // input: (B, T, 3, NH, HS) QKV
-                             int B, int T, int NH, int C);
-
-void attention_backward_cudnn(floatX* dqkvr,                                       // output
-                              floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
-                              int B, int T, int NH, int C);
-#else
-void create_cudnn() {}
-void destroy_cudnn() {}
-#endif // ENABLE_CUDNN
-
-// ----------------------------------------------------------------------------
-// all the kernels
-
-__global__ void encoder_forward_kernel3(floatX* out,
-                               const int* inp, const floatX* wte, const floatX* wpe,
-                               int B, int T, int C) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-    int N = B * T * C;
-    if (idx >= N) { return; }
-
-    int bt = idx / C;
-    int b = bt / T;
-    int t = bt % T;
-    int c = idx % C;
-
-    int ix = inp[b * T + t];
-
-    floatX* out_btc = out + b * T * C + t * C + c;
-    const floatX* wte_ix = wte + ix * C + c;
-    const floatX* wpe_tc = wpe + t * C + c;
-
-    x128 packed_out;
-    x128 wte128 = load128cs(wte_ix);
-    x128 wpe128 = load128cs(wpe_tc);
-    for (int k = 0; k < x128::size; k++) {
-        packed_out[k] = (floatX)((float)wte128[k] + (float)wpe128[k]);
-    }
-    store128(out_btc, packed_out);
-}
-
-template <typename T>
-__device__ void atomicStochasticAdd(T* address, float val0, float val1, unsigned int seed) {
-    static_assert(sizeof(T) == 2, "Only 16-bit atomicStochasticAdd supported.");
-    float2 val = make_float2(val0, val1);
-    unsigned int* address_as_uint = (unsigned int*)address;
-    unsigned int old = *address_as_uint, assumed;
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-    do {
-        assumed = old;
-        float2 new_fp32 = make_float2((float)(reinterpret_cast<T*>(&old)[0]) + val.x,
-                                      (float)(reinterpret_cast<T*>(&old)[1]) + val.y);
-        T new_rounded[2];
-        stochastic_rounding(new_fp32.x, &new_rounded[0], random);
-        stochastic_rounding(new_fp32.y, &new_rounded[1], random >> 16);
-        old = atomicCAS(address_as_uint, assumed, *(unsigned int*)&new_rounded);
-    } while (assumed != old);
-}
-__device__ void atomicStochasticAdd(float* address, float val0, float val1, unsigned int seed) {
-    atomicAdd(address, val0);
-    atomicAdd(address + 1, val1);
-}
-
-__global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
-                                        const floatX* dout, const int* inp,
-                                        int B, int T, int C, unsigned int seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = B * T * C;
-    idx *= 2; // 2 elements per thread
-    if (idx >= N) { return; }
-
-    int bt = idx / C;
-    int b = bt / T;
-    int t = bt % T;
-    int c = idx % C;
-
-    int ix = inp[b * T + t];
-
-    const floatX* dout_btc = dout + b * T * C + t * C + c;
-    floatX* dwte_ix = dwte + ix * C + c;
-    floatX* dwpe_tc = dwpe + t * C + c;
-
-    float2 dout_data = make_float2(dout_btc[0], dout_btc[1]);
-    atomicStochasticAdd(dwte_ix, dout_data.x, dout_data.y, seed);
-    atomicStochasticAdd(dwpe_tc, dout_data.x, dout_data.y, seed ^ 0xFFFFFFFF);
-}
-
-__global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
-                                    const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
-                                    const floatX* __restrict__ bias, int N, int C) {
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int num_warps = blockDim.x / WARP_SIZE;
-
-    int idx = blockIdx.x * num_warps + warp_id;
-    if(idx >= N) { return; } // guard
-
-    // the row of input that this group of threads is responsible for
-    const floatX* x = inp + idx * C;
-
-    // mean
-    float sum = 0.0f;
-    for (int i = lane_id; i < C; i += WARP_SIZE) {
-        sum += (float)x[i];
-    }
-    sum = warpReduceSum(sum);
-    float m = sum / C;
-    if(lane_id == 0 && mean != nullptr) {
-        __stcs(mean + idx, (floatX)m);
-    }
-
-    // rstd
-    sum = 0.0f;
-    for (int i = lane_id; i < C; i += WARP_SIZE) {
-        float diff = (float)x[i] - m;
-        sum += diff * diff;
-    }
-    sum = warpReduceSum(sum);
-    float s = rsqrtf(sum / C + 1e-5f);
-    if(lane_id == 0 && rstd != nullptr) {
-        __stcs(rstd + idx, (floatX)s);
-    }
-
-    // final normalization and scaling by weight/bias
-    floatX* o = out + idx * C;
-    for (int c = lane_id; c < C; c += WARP_SIZE) {
-        // load and store using the .cs "streaming" hint to the compiler,
-        // indicating that this data will not be reused soon, and can be streamed through the caches
-        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
-        float n = s * ((float)__ldcs(x+c) - m);
-        __stcs(o+c, (floatX)(n * (float)weight[c] + (float)bias[c]));
-    }
-}
-
-__global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
-                                               const floatX* inp1, const floatX* inp2,
-                                               const floatX* weight, const floatX* bias,
-                                               int N, int C) {
-    assert(blockDim.x == WARP_SIZE);
-
-    // load weights and biases into shared memory
-    // do this before we allow any threads to exit!
-    extern __shared__ char* params[];
-    // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
-    // let's keep everything as x128
-    x128* s_weight = reinterpret_cast<x128*>(params);
-    x128* s_bias = reinterpret_cast<x128*>(params) + (C / x128::size);
-    x128* s_res = reinterpret_cast<x128*>(params) + ((2 + threadIdx.y) * C / x128::size);
-
-    int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x128::size;
-    for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * x128::size) {
-        s_weight[i/x128::size] = load128(weight + i);
-        s_bias[i/x128::size] = load128(bias + i);
-    }
-    __syncthreads();
-
-    int idx = blockIdx.x * blockDim.y + threadIdx.y;
-    if(idx > N) return;
-
-    // adjust pointers to current token
-    residual += C * idx;
-    normed += C * idx;
-    inp1 += C * idx;
-    inp2 += C * idx;
-
-    const float eps = 1e-5f;
-    float sum = 0.0f;
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 in1 = load128cs(inp1 + c);
-        const x128 in2 = load128cs(inp2 + c);
-        x128 out;
-        for(int k = 0; k < x128::size; ++k) {
-            out[k] = (float)in1[k] + (float)in2[k];
-            sum += (float)out[k];
-        }
-        store128cs(residual + c, out);
-        s_res[c / x128::size] = out;
-    }
-
-    sum = warpReduceSum(sum);
-    float m = sum / C;
-    float v = 0.f;
-
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 res = s_res[c / x128::size];
-        for(int k = 0; k < x128::size; ++k) {
-            v += ((float)res[k] - m) * ((float)res[k] - m);
-        }
-    }
-
-    v = warpReduceSum(v) / C;
-    float s = rsqrtf(v + eps);
-
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 res = s_res[c / x128::size];
-        const x128 w = s_weight[c / x128::size];
-        const x128 b = s_bias[c / x128::size];
-        x128 out;
-        for(int k = 0; k < x128::size; ++k) {
-            float n = s * ((float)res[k] - m); // normalized output
-            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
-            out[k] = o;
-        }
-
-        store128cs(normed + c, out);
-    }
-    // cache the mean and rstd for the backward pass later
-    if(threadIdx.x == 0) {
-        mean[idx] = m;
-        rstd[idx] = s;
-    }
-}
-
-
-// inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
-__global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
-                               const floatX* inp,
-                               int B, int N, int NH, int d) {
-    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
-    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * NH * N * d) { return; }
-
-    // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
-    int b = idx / (NH * N * d);
-    int rest = idx % (NH * N * d);
-    int nh_ = rest / (N * d);
-    rest = rest % (N * d);
-    int n = rest / d;
-    int d_ = rest % d;
-    int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-    q[idx] = __ldcs(&inp[inp_idx]);
-    k[idx] = __ldcs(&inp[inp_idx + NH * d]);
-    v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
-}
-
-__global__ void permute_kernel_backward(floatX* dinp,
-                                        const floatX* dq, const floatX* dk, const floatX* dv,
-                                        int B, int N, int NH, int d) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * NH * N * d) { return; }
-
-    int b = idx / (NH * N * d);
-    int rest = idx % (NH * N * d);
-    int nh_ = rest / (N * d);
-    rest = rest % (N * d);
-    int n = rest / d;
-    int d_ = rest % d;
-
-    int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-    dinp[inp_idx] = dq[idx];
-    dinp[inp_idx + NH * d] = dk[idx];
-    dinp[inp_idx + 2 * (NH * d)] = dv[idx];
-}
-
-__global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH, int d) {
-   // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
-
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x);
-    // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
-    if (idx >= B * NH * N * d) { return; }
-
-    int b = idx / (NH * N * d);
-    int rest = idx % (NH * N * d);
-    int nh_ = rest / (N * d);
-    rest = rest % (N * d);
-    int n = rest / d;
-    int d_ = rest % d;
-    int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-    out[other_idx] = __ldcs(&inp[idx]);
-}
-
-__global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int B, int N, int NH, int d) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * NH * N * d) { return; }
-
-    int b = idx / (NH * N * d);
-    int rest = idx % (NH * N * d);
-    int nh_ = rest / (N * d);
-    rest = rest % (N * d);
-    int n = rest / d;
-    int d_ = rest % d;
-    int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-    dinp[idx] = (floatX)dout[other_idx];
-}
-
-__global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, const floatX* inp, int N, int T) {
-    // inp, out shape: (N, T, T), where N = B * NH
-    // fuses the multiplication by scale inside attention
-    // directly autoregressive, so we only compute the lower triangular part
-    // uses the online softmax algorithm
-    assert(T % 4  == 0);
-    const int warp_size = 32;
-    int lane_id = threadIdx.x % warp_size;
-    int warp_id = threadIdx.x / warp_size;
-    int num_warps = blockDim.x / warp_size;
-
-    // micro-optimization: we iterate backwards so that
-    // after the softmax backward operation completes, the cache retains the
-    // part of the matrix close to the upper left corner, which benefits the
-    // matmul operation that immediately follows.
-    // int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank(); // forward order
-    int idx = (gridDim.x - blockIdx.x - 1) * num_warps + warp_id; // backward order
-    if(idx >= N * T) {
-        return;
-    }
-    int own_pos = idx % T;
-    int pos_by_4 = own_pos / 4;
-
-    // one row of inp, i.e. inp[idx, :] of shape (T,)
-    const floatX* x = inp + idx * T;
-
-    // not INF, so we don't get NaNs accidentally when subtracting two values.
-    const float flt_max = 340282346638528859811704183484516925440.0f; // to avoid including float.h
-    float maxval = -flt_max;
-    float sumval = 0.0f;
-
-    const floatX* x_aligned = reinterpret_cast<const floatX*>(__builtin_assume_aligned(x, 16));
-    for (int i = lane_id; i < pos_by_4; i += warp_size) {
-        float regarray[4];
-        for (int k = 0; k < 4; ++k) {
-            regarray[k] = (float)x_aligned[4*i + k];
-        }
-        float old_maxval = maxval;
-        for(int k = 0; k < 4; ++k) {
-            maxval = fmaxf(maxval, regarray[k]);
-        }
-        sumval *= expf(inv_temperature * (old_maxval - maxval));
-        for(int k = 0; k < 4; ++k) {
-            sumval += expf(inv_temperature * (regarray[k] - maxval));
-        }
-    }
-
-    if(4*pos_by_4 + lane_id <= own_pos) {
-        float old_maxval = maxval;
-        maxval = fmaxf(maxval, (float)x[4*pos_by_4 + lane_id]);
-        sumval *= expf(inv_temperature * (old_maxval - maxval));
-        sumval += expf(inv_temperature * ((float)x[4*pos_by_4 + lane_id] - maxval));
-    }
-
-    float global_maxval = warpReduceMax(maxval);
-    sumval *= expf(inv_temperature * (maxval - global_maxval));
-
-    float sum = warpReduceSum(sumval);
-    float norm = 1.f / sum;
-
-    // divide the whole row by the sum
-    for (int i = lane_id; i <= own_pos; i += warp_size) {
-        // recalculation is faster than doing the round-trip through memory.
-        float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
-        __stcs(out + idx * T + i, (floatX)(ev * norm));
-    }
-}
-
-__global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const floatX* inp2) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-
-    x128 packed_out;
-    x128 packed_inp1 = load128cs(inp1 + idx);
-    x128 packed_inp2 = load128cs(inp2 + idx);
-    for (int k = 0; k < packed_inp1.size; k++) {
-        packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);
-    }
-    store128(out + idx, packed_out);
-}
-
-#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-
-    x128 packed_out;
-    x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
-    for(int k = 0; k < packed_inp.size; ++k) {
-        float xi = (float)packed_inp[k];
-        float cube = 0.044715f * xi * xi * xi;
-        packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
-    }
-    // store instead of storecs (without cache streaming) in case it is useful for the
-    // data to be in the cache for the next operation after this GeLU
-    store128(out + idx, packed_out);
-}
-
-__global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floatX* dout) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-
-    x128 packed_dinp;
-    x128 packed_inp = load128cs(inp + idx);
-    x128 packed_dout = load128cs(dout + idx);
-    for (int k = 0; k < packed_inp.size; ++k) {
-        float x = (float)packed_inp[k];
-        float cube = 0.044715f * x * x * x;
-        float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
-        float tanh_out = tanhf(tanh_arg);
-        float coshf_out = coshf(tanh_arg);
-        float sech_out = 1.0f / (coshf_out * coshf_out);
-        float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-        packed_dinp[k] = (floatX)(local_grad * (float)packed_dout[k]);
-    }
-    store128(dinp + idx, packed_dinp);
-}
-
-template<typename OutFloat, bool UseAuxBuffer>
-__global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
-                                             std::bool_constant<UseAuxBuffer>) {
-    constexpr const int bdx = 4;
-    constexpr const int bdy = WARP_SIZE / bdx;
-    assert(blockDim.x == bdx);
-    assert(blockDim.y == bdy);
-
-    int warp_d = (int)threadIdx.x;
-    int warp_c = (int)threadIdx.y;
-    int block_d = (int)threadIdx.z;
-
-    const int OC_per_warp = bdy * x128::size;  // 64 at BF16
-
-    int local_oc = warp_c * x128::size;
-    int global_oc = blockIdx.x * OC_per_warp + local_oc;
-
-    int local_bt = warp_d + bdx * block_d;
-    int bt_per_block = bdx * blockDim.z;
-
-    float accumulators[x128::size];
-    for (int k = 0; k < x128::size; k++) {
-        accumulators[k] = 0.0f;
-    }
-
-    if(global_oc < OC) {
-        // sum up over all bt within registers
-        for (int idx = blockIdx.y * bt_per_block + local_bt; idx < B * T; idx += gridDim.y * bt_per_block) {
-            x128 packed_dout = load128(dout + global_oc + idx*OC);
-            for (int k = 0; k < x128::size; k++) {
-                accumulators[k] += (float)packed_dout[k];
-            }
-        }
-    }
-
-    __shared__ float sub_results[x128::size][WARP_SIZE][bdy];
-
-    // reduce within-warp results
-    for (int k = 0; k < x128::size; k++) {
-        float v = accumulators[k];
-        v += __shfl_down_sync(0xffffffff, v, 1, 4);
-        v += __shfl_down_sync(0xffffffff, v, 2, 4);
-        if(warp_d == 0) {
-            sub_results[k][block_d][warp_c] = v;
-        }
-    }
-    __syncthreads();
-
-    // block-wide reductions
-    for (int k = block_d; k < x128::size; k += blockDim.z) {
-        float a = 0.f;
-        for (int r = warp_d; r < blockDim.z; r += bdx) {
-            float v = sub_results[k][r][warp_c];
-            v += __shfl_down_sync(0xffffffff, v, 1, 4);
-            v += __shfl_down_sync(0xffffffff, v, 2, 4);
-            a += v;
-        }
-        if(warp_d == 0 && global_oc < OC) {
-            if constexpr (!UseAuxBuffer) {
-                dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
-            } else {
-                dbias[global_oc + k + blockIdx.y * OC] = a;
-            }
-        }
-    }
-}
-
-__global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, size_t m) {
-    const size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
-    assert(n % x128::size == 0);
-    if (idx < n) {
-        f128 acc;
-        for(int k = 0; k < f128::size; ++k) {
-            acc[k] = 0.f;
-        }
-
-        for(int l = 0; l < m; ++l) {
-            f128 s = load128(src + idx + n * l);
-            for(int k = 0; k < f128::size; ++k) {
-                acc[k] += s[k];
-            }
-        }
-        for(int k = 0; k < f128::size; ++k) {
-            dst[idx + k] = (floatX) ((float)dst[idx + k] + acc[k]);
-        }
-    }
-}
-
-__global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with only 1024 threads?
-                layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                                            const floatX* dout, const floatX* inp, const floatX* weight,
-                                            const floatX* mean, const floatX* rstd,
-                                            int B, int T, int C) {
-    extern __shared__ float shared[]; // size = 2 * C + 1
-    int warpId = threadIdx.x / WARP_SIZE; // warp index within a block
-    int warpsInBlock = blockDim.x / WARP_SIZE; //number of warps in block
-    int baseIdx = blockIdx.x * warpsInBlock + warpId;
-    int warpThreadIdx = threadIdx.x % WARP_SIZE; // Thread index within the warp
-    int warpsInGrid = gridDim.x * warpsInBlock;
-    int C_per_iteration = WARP_SIZE * x128::size;
-    int iterations_C = C / C_per_iteration;
-
-    // the first half of shared memory is bias, second is weight
-    float* dbias_shared = shared;
-    float* dweight_shared = shared + C;
-
-    // init shared memory to zero
-    for(int i = threadIdx.x; i < C; i+= blockDim.x){
-       dbias_shared[i] = 0.0f;
-       dweight_shared[i] = 0.0f;
-    }
-    unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
-    __syncthreads();
-
-    for (int idx = baseIdx; idx < B * T; idx += warpsInGrid) {
-        int b = idx / T;
-        int t = idx % T;
-
-        const floatX* dout_bt = dout + b * T * C + t * C;
-        const floatX* inp_bt = inp + b * T * C + t * C;
-        floatX* dinp_bt = dinp + b * T * C + t * C;
-        const float mean_bt = (float)mean[b * T + t];
-        const float rstd_bt = (float)rstd[b * T + t];
-
-        // first: two reduce operations
-        float dnorm_mean = 0.0f;
-        float dnorm_norm_mean = 0.0f;
-        for (int i = warpThreadIdx * x128::size; i < C; i += WARP_SIZE * x128::size) {
-            x128 dout128_i   = load128(dout_bt + i);
-            x128 inp128_i    = load128(inp_bt  + i);
-            x128 weight128_i = load128(weight  + i);
-            for (int k = 0; k < x128::size; k++) {
-                float norm_bti = ((float)inp128_i[k] - mean_bt) * rstd_bt;
-                float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
-                dnorm_mean += dnorm_i;
-                dnorm_norm_mean += dnorm_i * norm_bti;
-            }
-        }
-        dnorm_mean = warpReduceSum(dnorm_mean) / C;
-        dnorm_norm_mean = warpReduceSum(dnorm_norm_mean) / C;
-
-        // now iterate again and accumulate all the gradients
-        // unfortunately we cannot use the same index for x128 arrays and shared memory
-        // as atomics can only be 32-bit rather than 128-bit (at least pre-SM90/Hopper)
-        // so this would result in an 8-way bank conflict, and kill performance
-        // so instead, we use a shared memory friendly index, and reorder before the final write
-        for (int i = 0; i < iterations_C; i++) {
-            int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
-            int shared_index = warpThreadIdx + (i * C_per_iteration);
-            x128 dout128   = load128cs(dout_bt + global_index);
-            x128 inp128    = load128cs(inp_bt  + global_index);
-            x128 dinp128   = load128(dinp_bt   + global_index);
-            x128 weight128 = load128(weight    + global_index);
-
-            for (int x = 0; x < x128::size; x++) {
-                float dout_i = (float)dout128[x];
-                float norm_bti = ((float)inp128[x] - mean_bt) * rstd_bt;
-                float dnorm_i = (float)weight128[x] * dout_i;
-                // gradient contribution to bias (using shared memory friendly index)
-                atomicAdd(&dbias_shared[shared_index + x*WARP_SIZE], dout_i);
-                // gradient contribution to weight (using shared memory friendly index)
-                atomicAdd(&dweight_shared[shared_index + x*WARP_SIZE], norm_bti * dout_i);
-                // gradient contribution to input
-                float dval = 0.0f;
-                dval += dnorm_i; // term 1
-                dval -= dnorm_mean; // term 2
-                dval -= norm_bti * dnorm_norm_mean; // term 3
-                dval *= rstd_bt; // final scale
-                dinp128[x] = (floatX)((float)dinp128[x] + dval);
-            }
-            // cache in L2 as this is read by the next kernel, but bypass L1 to minimise thrashing
-            store128cg(dinp_bt + global_index, dinp128);
-        }
-    }
-    // Accumulate into a FP32 scratchpad
-    // BF16 atomics are potentially much slower... and this is more precise!
-    // todo - could potentially avoid the extra copy if floatX is FP32, fairly negligible though
-    __syncthreads();
-    float* scratch_dbias = scratch;
-    float* scratch_dweight = scratch + C;
-    unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C));
-    for(int i = threadIdx.x; i < C; i+= blockDim.x) {
-        // global atomics in the same "shared memory banking friendly" order
-        atomicAdd(&scratch_dbias[i], dbias_shared[i]);
-        atomicAdd(&scratch_dweight[i], dweight_shared[i]);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        *tmp_flag = atomicInc(scratchFlag, gridDim.x);
-    }
-    __syncthreads();
-    if (*tmp_flag == gridDim.x-1) {
-        for (int i = warpId; i < iterations_C; i += warpsInBlock) {
-            // reorder from atomic/shared memory-friendly index to real global memory index
-            // and convert from float/FP32 to floatX/BF16 for the final write
-            int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
-            int shared_index = warpThreadIdx + (i * C_per_iteration);
-
-            x128 dbias128 = load128(dbias + global_index);
-            x128 dweight128 = load128(dweight + global_index);
-            for (int x = 0; x < x128::size; x++) {
-                float s_db = scratch_dbias[shared_index + x*WARP_SIZE];
-                float s_dw = scratch_dweight[shared_index + x*WARP_SIZE];
-                dbias128[x] = (floatX)(s_db + (float)dbias128[x]);
-                dweight128[x] = (floatX)(s_dw + (float)dweight128[x]);
-            }
-            store128(dbias + global_index, dbias128);
-            store128(dweight + global_index, dweight128);
-        }
-    }
-}
-
-__global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const floatX* datt, const floatX* att,
-                                                       int B, int T, int C, float scale) {
-    constexpr const int BlockSize = 256;
-    constexpr int T_per_block = 4;
-
-    // go through blocks in reverse order, so the slowest block starts first
-    int t0 = T - 1 - T_per_block*blockIdx.x;
-    int idx = blockIdx.y;
-
-    att += idx * T * T;
-    datt += idx * T * T;
-    dpreatt += idx * T * T;
-
-    for(int to = 0; to < T_per_block; ++to) {
-        int t = t0 - to;
-        if(t < 0) return;
-        const floatX* att_bth = att + t * T;
-        const floatX* datt_bth = datt + t * T;
-        floatX* dpreatt_bth = dpreatt + t * T;
-
-        float local_sum = 0;
-        for (int t2 = threadIdx.x; t2 <= t; t2 += BlockSize) {
-            local_sum += (float)att_bth[t2] * (float)datt_bth[t2];
-        }
-
-        local_sum = blockReduce<warpReduceSum>(local_sum);
-
-        for (int t3 = threadIdx.x; t3 <= t; t3 += BlockSize) {
-            // don't touch the cache. Some parts will still be here from the previous loop, and
-            // we want to exploit those.
-            float acc = (float)__ldcs(att_bth + t3) * ((float)__ldcs(datt_bth + t3) - local_sum);
-            __stcs(dpreatt_bth + t3, (floatX)(scale * acc));
-        }
-    }
-}
-
-// Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
-// Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
-__device__ float lerp(float start, float end, float weight) {
-    return fma(weight, end, fma(-weight, start, start));
-}
-
-template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
-                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
-                              float grad_scale, unsigned int seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_parameters) { return; }  // guard
-
-    // get the gradient, m, and v for this parameter
-    float grad = grad_scale * (float)grads_memory[idx];
-    float m = m_memory[idx];
-    float v = v_memory[idx];
-    // update the first moment (momentum)
-    m = lerp(grad, m, beta1);
-    m_memory[idx] = m;
-    // update the second moment (RMSprop)
-    v = lerp(grad * grad, v, beta2);
-    v_memory[idx] = v;
-    m /= beta1_correction;  // m_hat
-    v /= beta2_correction;  // v_hat
-    // fetch the old value of this parameter as a float, from either source
-    float old_param = (master_params_memory != NULL) ? master_params_memory[idx] : (float)params_memory[idx];
-    // update this parameter
-    float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
-    // update our low precision version of the parameters using stochastic rounding
-    // this will be used in the next forward pass
-    // TODO: simply doing `params_memory[i] = (floatX)param;` breaks everything (why?)
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-    stochastic_rounding(param, &params_memory[idx], random);
-    // write the full, float version of the param into our master copy, if we maintain one
-    // this will be used in the next update
-    if (master_params_memory != NULL) { master_params_memory[idx] = param; }
-}
-
-template<class T>
-__global__ void global_norm_squared_kernel(float* out, const T* data, size_t count) {
-    // we want as few atomics as possible, so each block tries to do
-    // the maximum amount of work (so no fixed chunk, but instead iterating
-    // until we run out of data), and then we reduce inside the block
-    // and finally have just one atomic per block.
-    // out will be updated atomically from all thread blocks. It is a float, so the
-    // atomic op is unproblematic
-    size_t index = threadIdx.x + blockDim.x * blockIdx.x;
-    size_t grid_width = blockDim.x * gridDim.x;
-    float accumulator = 0.f;
-    for(size_t i = index; i < count; i += grid_width) {
-        accumulator += (float)data[i] * (float)data[i];
-    }
-    // warp-level reduce
-    float block_sum = blockReduce<warpReduceSum>(accumulator);
-    if(threadIdx.x == 0) {
-        atomicAdd(out, block_sum);
-    }
-}
-
-struct SoftmaxParams {
-    float Scale;
-    float Offset;
-};
-
-__device__ SoftmaxParams prepare_softmax_blockwide3(int idx, const floatX* inp, int V, int P) {
-    // same but not float4
-    // one row of inp, i.e. inp[idx, :] of shape (V,)
-
-    const floatX* x = inp + idx * P;
-    float thread_maxval = -INFINITY;
-    float thread_sumval = 0.0f;
-    int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x;
-
-    // special-case loop to handle the unaligned elements at the end of the array
-    // this lets us skip the bounds check in the main loop below, which improves performance
-    while ((i+1)*x128::size > V) {
-        for(int k = 0; k < x128::size; ++k) {
-            if (i*x128::size+k >= V) {
-                break; // bounds checking against real V (rather than padded P)
-            }
-            float v = (float)x[i*x128::size+k];
-            float old_maxval = thread_maxval;
-            thread_maxval = fmaxf(thread_maxval, v);
-            thread_sumval *= expf((old_maxval - thread_maxval));
-            thread_sumval += expf(v - thread_maxval);
-        }
-        i -= blockDim.x;
-    }
-
-    // main loop for the bulk of the iterations (no bounds checking required!)
-    for (; i >= 0; i -= blockDim.x) {
-        x128 packed_x = load128(x + i * x128::size); // load and keep in cache until fused_classifier loop
-        for(int k = 0; k < x128::size; ++k) {
-            float v = (float)packed_x[k];
-            float old_maxval = thread_maxval;
-            thread_maxval = fmaxf(thread_maxval, v);
-            thread_sumval *= expf((old_maxval - thread_maxval));
-            thread_sumval += expf(v - thread_maxval);
-        }
-    }
-
-    // Block Max Reduction -> Maths -> Block Sum Reduction
-    float block_maxval = blockReduce<warpReduceMax>(thread_maxval, false, -INFINITY);
-    thread_sumval *= expf(thread_maxval - block_maxval);
-    float block_sumval = blockReduce<warpReduceSum>(thread_sumval);
-
-    // return the softmax parameters
-    return SoftmaxParams{1.f / block_sumval, block_maxval};
-}
-
-// will _update_ logits to logit gradients
-// uses template to decide whether to write logits and probs
-// split both loops in "multiple-of-x128-size" and "bounds-checked remainder" parts
-template <bool WriteLogits = true, bool WriteProbs = false>
-__global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
-                fused_classifier_kernel5(floatX* logits, floatX* losses, floatX* probs,
-                                         const float dloss, const int* targets,
-                                         int B, int T, int V, int P) {
-    int idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
-    int ix = targets[idx];
-
-    // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
-    SoftmaxParams sp = prepare_softmax_blockwide3(idx, logits, V, P);
-
-    // calculate the probability needed for the loss and update (single-threaded)
-    if(threadIdx.x == 0) {
-        float prob = expf((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[idx] = (floatX)(-logf(prob));
-    }
-
-    // calculate the gradients directly, saves bandwidth from probs during training
-    // but also supports writing probs for inference-only and debugging
-    const floatX* logits_vec = logits + idx * P;
-    for (int i = threadIdx.x; i < V/x128::size; i += blockDim.x) {
-        // this is the 2nd read of logits after the one in prepare_softmax2
-        // it will be overwritten by the logits gradients which is when we reduce cache persistence
-        x128 packed_logits_vec = load128(logits_vec + i * x128::size); // rely on cs of store128cs
-        x128 packed_probs;
-        for(int k = 0; k < x128::size; ++k) {
-            int element = i*x128::size + k;
-            float prob = expf((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
-            packed_probs[k] = (floatX)prob;
-            float indicator = (element == ix) ? 1.0f : 0.0f;
-            packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
-        }
-        if (WriteLogits){
-            // reduce cache persistence for the overwritten logits
-            // to maximise probability that logits remain in cache between prepare_softmax and here
-            store128cs(logits + idx * P + i * x128::size, packed_logits_vec);
-        }
-        if (WriteProbs) {
-            store128(probs + idx * P + i * x128::size, packed_probs);
-        }
-    }
-
-    // handle remaining elements after the last multiple of x128::size
-    // e.g. if V = 8003, and x128::size = 8, we need to handle the last 3 elements
-    int unaligned_start = V & ~(x128::size - 1); // round down to multiple of x128::size
-    for (int i = threadIdx.x + unaligned_start; i < V; i++) {
-        float prob = expf((float)logits_vec[i] - sp.Offset) * sp.Scale;
-        float indicator = (i == ix) ? 1.0f : 0.0f;
-        float dlogit = (prob - indicator) * dloss;
-        if (WriteLogits){
-            __stcs(logits + idx * P + i, (floatX)dlogit);
-        }
-        if (WriteProbs) {
-            probs[idx * P + i] = (floatX)prob;
-        }
-    }
-}
-
-// device functions and the kernel to cast data between types
-template<typename Td, typename Ts>
-__device__ Td cast_value(Ts val);
-
-template<>
-__device__ float cast_value<float, float>(float val) {
-    return val;
-}
-
-template<>
-__device__ float cast_value<float, half>(half val) {
-    return __half2float(val);
-}
-
-template<>
-__device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
-    return __bfloat162float(val);
-}
-
-template<typename Td, typename Ts>
-__global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // need to try grid stride looping for more perf later
-    if (idx < n) {
-        dst[idx] = cast_value<Td, Ts>(src[idx]);
-    }
-}
-
-// ----------------------------------------------------------------------------
-// kernel launchers
-
-void encoder_forward(floatX* out,
-                     const int* inp, const floatX* wte, const floatX* wpe,
-                     int B, int T, int C) {
-    NVTX_RANGE_FN();
-    const int block_size = 256;
-    const int N = B * T * C;
-    const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
-    cudaCheck(cudaGetLastError());
-}
-
-void encoder_backward(floatX* dwte, floatX* dwpe,
-                    const floatX* dout, const int* inp,
-                    int B, int T, int C, unsigned int seed) {
-    NVTX_RANGE_FN();
-    const int N = B * T * C;
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size * 2); // each thread handles 2 elements
-    encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C, seed);
-    cudaCheck(cudaGetLastError());
-}
-
-void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
-                       floatX* inp, const floatX* weight, const floatX* bias,
-                       int B, int T, int C) {
-    NVTX_RANGE_FN();
-    const int block_size = 512;
-    const int N = B * T;
-    const int grid_size = CEIL_DIV(N * WARP_SIZE, block_size);
-    layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
-    cudaCheck(cudaGetLastError());
-}
-
-// https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
-void matmul_forward_cublaslt(floatX* out,
-                     floatX* inp, floatX* weight, floatX* bias,
-                     int B, int T, int C, int OC) {
-    NVTX_RANGE_FN();
-    int has_bias = (bias != NULL);
-
-    // check bias alignment
-    if(((uintptr_t)bias % 16) != 0) {
-        printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // these need to be in FP16 if and only if alpha/beta are CUBLAS_COMPUTE_16F
-    const float alpha = 1.0f, beta = 0.0f;
-
-    int returnedResults = 0;
-    cublasLtMatmulDesc_t operationDesc;
-    cublasLtMatmulPreference_t preference;
-    cublasLtMatrixLayout_t weightLayout;
-    cublasLtMatrixLayout_t inputLayout;
-    cublasLtMatrixLayout_t outputLayout;
-    cublasLtMatrixLayout_t biasLayout;
-    cublasLtMatmulHeuristicResult_t heuristic;
-
-    // create the operation descriptor
-    cublasOperation_t opNoTranspose = CUBLAS_OP_N;
-    cublasOperation_t opTranspose = CUBLAS_OP_T;
-    cublasLtEpilogue_t epilogueBias = has_bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT;
-
-    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute, CUDA_R_32F)); // FP16 if CUBLAS_COMPUTE_16F
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
-
-    // define matrix layouts
-    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUBLAS_LOWP, C, OC, C));
-    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUBLAS_LOWP, C, B*T, C));
-    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUBLAS_LOWP, OC, B*T, OC));
-    cublasCheck(cublasLtMatrixLayoutCreate(&biasLayout, CUBLAS_LOWP, OC, 1, OC));
-
-    // create a preference handle with specified max workspace
-    cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
-    cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
-
-    // find a suitable algorithm
-    cublasCheck(cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc,
-        weightLayout, inputLayout, outputLayout, outputLayout,
-        preference, 1, &heuristic, &returnedResults));
-    if (returnedResults == 0) {
-        printf("No cuBLASLt algorithm: B: %d, T: %d, C: %d, OC: %d, bias: %d\n", B, T, C, OC, has_bias);
-        exit(EXIT_FAILURE);
-    }
-
-    // call the matmul
-    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
-        &alpha, weight, weightLayout, inp, inputLayout, &beta,
-        out, outputLayout, out, outputLayout, &heuristic.algo,
-        cublaslt_workspace, cublaslt_workspace_size, 0));
-
-    // cleanups
-    cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
-    cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
-    cublasCheck(cublasLtMatrixLayoutDestroy(weightLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
-}
-
-void attention_forward(floatX* out, floatX* qkvr, floatX* att,
-                       floatX* inp,
-                       int B, int T, int C, int NH) {
-    NVTX_RANGE_FN();
-    // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
-    // Its contents will be overwritten by this function.
-    const int block_size = 256;
-    const float alpha = 1.0f, beta = 0.0f;
-
-    // inp is (B, T, 3C) QKV
-    // preatt, att are (B, NH, T, T)
-    // output is (B, T, C)
-    int HS = C / NH; // head size
-
-    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
-    floatX *q, *k, *v;
-    q = qkvr + 0 * B * T * C;
-    k = qkvr + 1 * B * T * C;
-    v = qkvr + 2 * B * T * C;
-    int total_threads = B * NH * T * HS;
-    int num_blocks = CEIL_DIV(total_threads, block_size);
-    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
-
-
-    floatX* preatt = inp;
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
-                                     CUBLAS_OP_T, CUBLAS_OP_N,
-                                     T, T, HS, &alpha,
-                                     k, CUBLAS_LOWP, HS, T * HS,
-                                     q, CUBLAS_LOWP, HS, T * HS,
-                                     &beta, preatt, CUBLAS_LOWP, T, T * T,
-                                     B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
-
-    // multiply all elements of preatt elementwise by scale
-    float scale = 1.0 / sqrtf(HS);
-    int grid_size = CEIL_DIV(B * NH * T * 32, block_size);
-    softmax_forward_kernel5<<<grid_size, block_size>>>(att, scale, preatt, B * NH, T);
-
-    // new approach: first cuBLAS another batched matmul
-    floatX* vaccum = inp;
-    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
-                                     CUBLAS_OP_N, CUBLAS_OP_N,
-                                     HS, T, T, &alpha,
-                                     v, CUBLAS_LOWP, HS, T * HS,
-                                     att, CUBLAS_LOWP, T, T * T,
-                                     &beta, vaccum, CUBLAS_LOWP, HS, T * HS,
-                                     B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
-
-    // now unpermute
-    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
-    cudaCheck(cudaGetLastError());
-}
-
-void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
-    NVTX_RANGE_FN();
-    const int block_size = 256;
-    assert(N % block_size == 0);
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2);
-    cudaCheck(cudaGetLastError());
-}
-
-void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
-                             const floatX* inp1, const floatX* inp2,
-                             const floatX* weight, const floatX* bias,
-                             int N, int C) {
-    const int block_size = 256;
-    int block_y = block_size / WARP_SIZE;
-    const int grid_size = CEIL_DIV(N, block_y);
-    size_t smem = (2 + block_y) * C * sizeof(floatX);
-
-    // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
-    // this may fail, in which case we fall back to the smem free implementation.
-    cudaCheck(cudaGetLastError());
-    auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaGetLastError();
-    if(status == cudaSuccess) {
-        fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem>>>(residual, normed, mean, rstd, inp1, inp2,
-                                                                               weight, bias, N, C);
-    } else {
-        residual_forward(residual, inp1, inp2, N*C);
-        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C);
-    }
-    cudaCheck(cudaGetLastError());
-}
-
-
-void gelu_forward(floatX* out, const floatX* inp, int N) {
-    NVTX_RANGE_FN();
-    const int block_size = 512;
-    assert(N % block_size == 0);
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp);
-    cudaCheck(cudaGetLastError());
-}
-
-void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
-    NVTX_RANGE_FN();
-    const int block_size = 128;
-    assert(N % block_size == 0);
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout);
-    cudaCheck(cudaGetLastError());
-}
-
-void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
-                     floatX* dout, floatX* inp, floatX* weight,
-                     float* dbias_buffer,
-                     int B, int T, int C, int OC) {
-    NVTX_RANGE_FN();
-    float one = 1.0f, zero = 0.0f;
-
-    // backward to bias, if given, does a +=
-    if (dbias != NULL) {
-        // Each warp is responsible for 8 * "x128::size" = 64 OCs at BF16 (OC must be a multiple of 64!)
-        // Block size is 1024 | 768 threads (32|24 warps) and we reduce those values into 1 at the end
-
-        const int block_size = deviceProp.maxThreadsPerMultiProcessor == 1536 ? 768 : 1024;
-
-        dim3 block_dim = {4, 8, (unsigned)block_size/WARP_SIZE};
-        const int OC_per_warp = block_dim.y * x128::size; // 64 at BF16
-        const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
-        const int grid_size_y = max(1, deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / (block_size * grid_size_x)); // full GPU!
-
-        // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
-        // and write results directly to the output.
-        if(grid_size_y == 1) {
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
-            cudaCheck(cudaGetLastError());
-        } else {
-            // kernel 9 overwrites temp buffer, so no need to memset
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
-            cudaCheck(cudaGetLastError());
-            reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256>>>(dbias, dbias_buffer, OC, grid_size_y);
-            cudaCheck(cudaGetLastError());
-        }
-    }
-
-    // backward to input, uses = in the backward pass (set the gradient)
-    cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one,
-                             weight, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero,
-                             dinp, CUBLAS_LOWP, C, cublas_compute, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
-    cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one,
-                             inp, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &one,
-                             dweight, CUBLAS_LOWP, C, cublas_compute, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    cudaCheck(cudaGetLastError());
-}
-
-void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                        const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
-                        int B, int T, int C) {
-    NVTX_RANGE_FN();
-    // todo - forcing 3 x 512 threads per SM maximum is a bit hacky, but more than that results in
-    // cache thrashing and lower performance on A100... is there a better way?
-    const int block_size = 512;
-    const int blocks_per_sm = min(3, (deviceProp.maxThreadsPerMultiProcessor / 1024));
-    const int grid_size = blocks_per_sm * deviceProp.multiProcessorCount;
-    size_t shared_mem_size = (2 * C + 1) * sizeof(float);
-
-    cudaMemset(scratch, 0, (2 * C + 1) * sizeof(float));
-    layernorm_backward_kernel8<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
-    cudaCheck(cudaGetLastError());
-}
-
-
-// the sequence of transformations in this compound op is:
-// inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* datt, floatX* scratch,
-                        const floatX* dout,
-                        const floatX* qkvr, const floatX* att,
-                        int B, int T, int C, int NH) {
-    NVTX_RANGE_FN();
-    const int block_size = 256;
-    int HS = C / NH; // head size
-    const float alpha = 1.0f, beta = 0.0f;
-
-    // unpack convenience pointers into q, k, v
-    const floatX *q, *k, *v;
-    q = qkvr + 0 * B * T * C;
-    k = qkvr + 1 * B * T * C;
-    v = qkvr + 2 * B * T * C;
-    floatX *dq, *dk, *dv;
-    dq = dqkvr + 0 * B * T * C;
-    dk = dqkvr + 1 * B * T * C;
-    dv = dqkvr + 2 * B * T * C;
-
-    // backward through the unpermute operation
-    int num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
-    // backward into datt
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha,
-                                           v, CUBLAS_LOWP, HS, T * HS, scratch, CUBLAS_LOWP, HS, T * HS, &beta,
-                                           datt, CUBLAS_LOWP, T, T * T, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
-    // backward into dv
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &alpha,
-                                           scratch, CUBLAS_LOWP, HS, T * HS, att, CUBLAS_LOWP, T, T * T, &beta,
-                                           dv, CUBLAS_LOWP, HS, T * HS, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
-    // backward into preatt
-    int hs = C / NH; // head size
-    float scale = 1.0f / sqrtf(hs);
-    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256, 256>>>(dpreatt, datt, att, B, T, C, scale);
-    // backward into q
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha,
-                                           k, CUBLAS_LOWP, HS, T * HS, dpreatt, CUBLAS_LOWP, T, T * T, &beta,
-                                           dq, CUBLAS_LOWP, HS, T * HS, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
-    // backward into k
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &alpha,
-                                           q, CUBLAS_LOWP, HS, T * HS, dpreatt, CUBLAS_LOWP, T, T * T, &beta,
-                                           dk, CUBLAS_LOWP, HS, T * HS, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
-    // backward into inp
-    num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-    permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
-    cudaCheck(cudaGetLastError());
-}
-
-// replaces logits with logit gradients
-template <typename Type>
-void fused_classifier(Type* logits, Type* losses,
-                      const float dloss, const int* targets,
-                      int B, int T, int V, int P) {
-    NVTX_RANGE_FN();
-    const int block_size = 1024;
-    const int N = B * T;
-    const int grid_size = N;
-    fused_classifier_kernel5<<<grid_size, block_size, 512>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
-    cudaCheck(cudaGetLastError());
-}
-
-template<typename T>
-void global_norm_squared(float* out, const T* values, size_t count) {
-    const int block_size = 512;
-    // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
-    // having one block less than possible is a tiny performance hit, having
-    // one block too many is catastrophic, since it only can start once all the other
-    // blocks finish. anyway, I think cuda_threads_per_SM should be a multiple of 512
-    // on all gpus, so the division really is going to be exact.
-    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
-    assert(grid_size > 0);      // gives a better error than letting the call below fail
-    // initialize out with zero
-    cudaCheck(cudaMemset(out, 0, sizeof(float)));
-    global_norm_squared_kernel<<<grid_size, block_size>>>(out, values, count);
-    cudaCheck(cudaGetLastError());
 }
 
 // ----------------------------------------------------------------------------
@@ -1762,10 +315,8 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
 // allocate memory for the parameters and point the individual tensors to the right places
 void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
     // calculate the total number of parameters and bytes across all tensors
-    size_t num_parameters = 0;
     size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters += param_elements[i];
         num_parameters_bytes += param_elements[i] * param_sizeof[i];
     }
     // malloc all parameters all at once on the device
@@ -1802,7 +353,7 @@ typedef struct {
     floatX* fch_gelu; // (L, B, T, 4*C)
     floatX* fcproj; // (L, B, T, C)
     floatX* residual3; // (L, B, T, C)
-    floatX* lnf; // (B, T, C)
+    floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
     floatX* lnf_mean; // (B, T)
     floatX* lnf_rstd; // (B, T)
     floatX* losses; // (B, T)
@@ -1822,7 +373,8 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     size_t NH = config.num_heads;
     size_t C = config.channels;
     act_sizes[0] = B * T * C; // encoded
-    act_sizes[1] = L * B * T * C; // ln1
+    // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
+    act_sizes[1] = (recompute < 2) ? L * B * T * C : 0; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
     act_sizes[4] = L * B * T * C; // atty
@@ -1834,12 +386,13 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     #endif
     act_sizes[6] = L * B * T * C; // attproj
     act_sizes[7] = L * B * T * C; // residual2
-    act_sizes[8] = L * B * T * C; // ln2
+    // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
+    act_sizes[8] = (recompute < 2) ? L * B * T * C : 0; // ln2
     act_sizes[9] = L * B * T; // ln2_mean
     act_sizes[10] = L * B * T; // ln2_rstd
     act_sizes[11] = L * B * T * 4*C; // fch
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    act_sizes[12] = (recompute == 0) ? L * B * T * 4*C : B * T * 4*C;
+    act_sizes[12] = (recompute < 1) ? L * B * T * 4*C : B * T * 4*C;
     act_sizes[13] = L * B * T * C; // fcproj
     act_sizes[14] = L * B * T * C; // residual3
     act_sizes[15] = B * T * C; // lnf
@@ -1887,8 +440,13 @@ void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(floatX)));
     char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < n; i++) {
-        *(targets[i]) = (floatX*)acts_memory_iterator;
-        acts_memory_iterator += act_sizes[i] * sizeof(floatX);
+        // extra protection so we don't accidentally use an empty buffer
+        if(act_sizes[i] == 0) {
+            *(targets[i]) = NULL;
+        }else {
+            *(targets[i]) = (floatX*) acts_memory_iterator;
+            acts_memory_iterator += act_sizes[i] * sizeof(floatX);
+        }
     }
     return acts_memory;
 }
@@ -1946,10 +504,70 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    float* cpu_losses_fp32; // same but fp32
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
-    int use_master_weights;
-    int recompute;
+    int use_master_weights; // keep master weights copy in float for optim update? 0|1
+    int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
+    // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
+    int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
+    int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
+
+void gpt2_init_common(GPT2 *model) {
+    // common inits outside of the model weights
+    // the weights are initialized either in:
+    // - gpt2_build_from_checkpoint() if loading from a checkpoint
+    // - gpt2_build_from_random() if starting from scratch
+    // memory lazily initialized in forward()
+    model->acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->cpu_losses = NULL;
+    model->cpu_losses_fp32 = NULL;
+    // the B,T params are determined and set, fixed on first batch in forward()
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
+    // memory lazily initialized in backward()
+    model->grads_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->workload_indices = NULL; // on cpu, for encoder_backward
+    model->bucket_info = NULL; // on cpu, for encoder_backward
+    // memory lazily initialized in update()
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->master_weights = NULL;
+    // other default settings
+    model->rng_state = 13371337; // used in stochastic rounding
+    model->use_master_weights = 1; // safe default: do keep master weights in fp32
+    model->recompute = 1; // good default: recompute gelu but not layernorm
+}
+
+void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
+    // write the model to a checkpoint file
+    printf0("Writing model to %s\n", checkpoint_path);
+    FILE *model_file = fopenCheck(checkpoint_path, "wb");
+    // write the header first
+    int model_header[256];
+    memset(model_header, 0, sizeof(model_header));
+    model_header[0] = 20240326; // magic number
+    assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
+    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5; // version
+    model_header[2] = model->config.max_seq_len;
+    model_header[3] = model->config.vocab_size;
+    model_header[4] = model->config.num_layers;
+    model_header[5] = model->config.num_heads;
+    model_header[6] = model->config.channels;
+    model_header[7] = model->config.padded_vocab_size;
+    fwrite(model_header, sizeof(int), 256, model_file);
+    // write the parameters
+    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
+    cudaCheck(cudaMemcpy(params_memory_cpu, model->params_memory, model->num_parameters_bytes, cudaMemcpyDeviceToHost));
+    fwrite(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
+    free(params_memory_cpu);
+    // close file, we're done
+    fcloseCheck(model_file);
+}
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
@@ -2008,28 +626,102 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)mallocCheck(model->num_parameters_bytes);
+    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
     freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
-    // other inits
-    model->acts_memory = NULL;
-    model->grads_memory = NULL;
-    model->m_memory = NULL;
-    model->v_memory = NULL;
-    model->master_weights = NULL;
-    model->grads_acts_memory = NULL;
-    model->inputs = NULL;
-    model->targets = NULL;
-    model->cpu_losses = NULL;
-    model->batch_size = 0;
-    model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f will designate no loss
-    model->rng_state = 13371337;
-    model->use_master_weights = 1; // keep master weights copy in float for optim update?
-    model->recompute = 1; // default to recompute gelu during backward
+    gpt2_init_common(model);
+}
+
+void gpt2_build_from_random(GPT2 *model, int depth) {
+    // init random (training from scratch)
+
+    // parameterize the size of gpt2 based only on the depth of the model (num_layers)
+    model->config.num_layers = depth;
+    // follows GPT-2 sizes
+    int channels, num_heads;
+    if      (depth == 6)  { channels = 384; num_heads = 6; } // gpt2-tiny (30M)
+    else if (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
+    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
+    else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
+    model->config.channels = channels;
+    model->config.num_heads = num_heads;
+    model->config.max_seq_len = 1024;
+    model->config.vocab_size = 50257;
+    model->config.padded_vocab_size = 50304; // padded to 128
+
+    // fill in all the parameter tensor dimensions and types
+    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
+    model->num_parameters = 0;
+    model->num_parameters_bytes = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        model->num_parameters += model->param_elements[i];
+        model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
+    }
+    // create memory for model parameters on the device
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+
+    // allocate and random init the memory for all the parameters with GPT-2 schema
+    // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
+    // NOTE: assuming all parameters are of the type floatX, could be relaxed later
+    mt19937_state init_rng;
+    manual_seed(&init_rng, 42);
+    floatX* params_memory_cpu = (floatX*)mallocCheck(model->num_parameters_bytes);
+    memset(params_memory_cpu, 0, model->num_parameters_bytes);
+    // fill in all the weights with random values
+    float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
+    // we have to init all these tensors exactly in the order that PyTorch initializes them
+    // so that we can match them up and get correctness and exactly the same initial conditions
+    size_t L = model->config.num_layers;
+    size_t offset = 0;
+    for (int l = 0; l < L; l++) {
+        offset = 0;
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            // the layernorm parameters are all initialized to 1
+            if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
+                for (size_t j = 0; j < model->param_elements[i]; j++) {
+                    params_memory_cpu[offset + j] = 1.0f;
+                }
+            }
+            // weights tensors are handled here
+            if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
+              || i == 4 || i == 6 || i == 10 || i == 12) {
+                int n = model->param_elements[i];
+                size_t layer_offset = 0;
+                if (i == 0) {
+                    // for wte tensor (padded vocab) override to init V instead of Vp rows
+                    n = model->config.vocab_size * model->config.channels;
+                }
+                if (i == 4 || i == 6 || i == 10 || i == 12) {
+                    // weight tensors, we are only initializing layer l
+                    assert(n % L == 0);
+                    n = n / L;
+                    layer_offset = l * n;
+                }
+                // in GPT-2, the projections back into the residual stream are additionally
+                // scaled by 1/sqrt(2*L) for training stability
+                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                // okay let's draw the random numbers and write them
+                float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
+                normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
+                for (size_t j = 0; j < n; j++) {
+                    params_memory_cpu[offset + layer_offset + j] = (floatX)fp32_buffer[j];
+                }
+                free(fp32_buffer);
+            }
+            offset += model->param_elements[i];
+        }
+    }
+
+    // copy them to GPU
+    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
+    free(params_memory_cpu);
+
+    gpt2_init_common(model);
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, int grad_accum_steps=1) {
@@ -2077,6 +769,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(floatX)));
+        cudaCheck(cudaMallocHost((void**)&model->cpu_losses_fp32, B * T * sizeof(float)));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -2119,18 +812,18 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         floatX* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = acts.ln1 + l * B * T * C;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_attproj = acts.attproj + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute == 0) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_fcproj = acts.fcproj + l * B * T * C;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
 
@@ -2156,7 +849,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
 
         // OK, fusion across blocks.
         if(l+1 != L) {
-            floatX* l_ln1 = acts.ln1 + (l + 1) * B * T * C;
+            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
             floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
@@ -2181,7 +874,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
-        for (int i = 0; i < B*T; i++) { mean_loss += (float)(model->cpu_losses[i]); }
+        for (int i = 0; i < B*T; i++) {
+            float loss = (float)(model->cpu_losses[i]);
+            model->cpu_losses_fp32[i] = loss;
+            mean_loss += loss;
+        }
         mean_loss /= B*T*grad_accum_steps;
         model->mean_loss = mean_loss;
     } else {
@@ -2197,7 +894,7 @@ void gpt2_zero_grad(GPT2 *model) {
     }
 }
 
-void gpt2_backward(GPT2 *model) {
+void gpt2_backward(GPT2 *model, int* inputs) {
     NVTX_RANGE_FN();
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -2212,7 +909,7 @@ void gpt2_backward(GPT2 *model) {
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass activations and we will save memory.
-        size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
+        size_t bw_act_sizes[NUM_BACKWARD_TENSORS];
         fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, model->config);
         // count up and allocate the space
         model->num_grad_acts = 0;
@@ -2223,6 +920,11 @@ void gpt2_backward(GPT2 *model) {
         model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         // init gradients of parameters and activations to zero
         gpt2_zero_grad(model);
+        // initialise cpu scratch buffers for encoder backward
+        size_t num_c_groups = CEIL_DIV(model->config.channels, (WARP_SIZE * x128::size));
+        assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
+        model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
+        model->bucket_info = (int4*)mallocCheck(sizeof(int4) * model->batch_size * model->seq_len * num_c_groups);
     }
 
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
@@ -2243,7 +945,8 @@ void gpt2_backward(GPT2 *model) {
     cudaCheck(cudaMemset(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX)));
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
-    float* scratchF = (float*)acts.output;
+    float*  scratchF = (float*)acts.output;
+    floatX* scratchX = (floatX*)acts.output;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
@@ -2256,6 +959,10 @@ void gpt2_backward(GPT2 *model) {
     floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
+    // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
+    // scratch for backward computations
+    floatX* dl_btc = residual;
+
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
         NvtxRange layer_range("Layer", l);
@@ -2264,9 +971,11 @@ void gpt2_backward(GPT2 *model) {
 
         // get the pointers of the weights for this layer
         floatX* l_ln1w = params.ln1w + l * C;
+        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
+        floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
@@ -2283,24 +992,21 @@ void gpt2_backward(GPT2 *model) {
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = acts.ln1 + l * B * T * C;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
         floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
         floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = (model->recompute == 0) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
 
-        // we need a B x T x C buffer; thankfully, the forward activation for lnf isn't needed anymore,
-        // so we can co-opt it here.
-        floatX* dl_btc = (floatX*)acts.lnf;
         floatX* dl_bt4c = (floatX*)grads_acts.bt4c;
 
         // start the backward pass for this layer
@@ -2310,7 +1016,11 @@ void gpt2_backward(GPT2 *model) {
             gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C);
-        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
+        gelu_backward_inplace(dl_bt4c, l_fch, B*T*4*C);
+        if(model->recompute >= 2) {
+            // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
@@ -2325,25 +1035,27 @@ void gpt2_backward(GPT2 *model) {
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
         floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
-        floatX* scratchX =  (floatX*)acts.output;
         attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         #endif
-
+        if(model->recompute >= 2) {
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
-    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, random_u32(&model->rng_state));
+    encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
+                     dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state));
 }
 
-// Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_config) {
+// Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
+float multi_gpu_cpu_float_sum(float value) {
 #ifdef MULTI_GPU
-    // MPI doesn't support all reduce with mean, so we sum up, then divide.
+    // note MPI doesn't support all reduce with mean, only sum
     float result;
     mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    return result / multi_gpu_config->num_processes;
+    return result;
 #else
     return value;
 #endif
@@ -2351,12 +1063,12 @@ float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_conf
 
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
 // todo - this version only works if all the parameters are the same size (floatX)
-void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
+void gpt2_multi_gpu_grad_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
     NVTX_RANGE_FN();
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
+    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
     if(multi_gpu_config->zero_stage == 0) {
         //  no ZERO == standard DDP: Average all gradients.
         ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
@@ -2375,33 +1087,56 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 }
 
 float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clip, int t, MultiGpuConfig* multi_gpu_config) {
+    // update the model parameters using the AdamW optimizer
+    // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
+    // so we may not be responsible for the entire parameter tensor
+    // also, this function was very simple a while back but become very complex, only because we want to
+    // selectively weight decay some, but not all tensors :(
+    // TODO: revisit and probably refactor this entire function
     NVTX_RANGE_FN();
-    size_t num_parameters = multi_gpu_config->shard_num_parameters;
-    floatX* params_memory = (floatX*)model->params_memory + multi_gpu_config->shard_offset;
-    floatX* grads_memory = (floatX*)model->grads_memory + multi_gpu_config->shard_offset;
+    size_t shard_num_parameters = multi_gpu_config->shard_num_parameters; // num parameters we are responsible for
+    size_t shard_offset = multi_gpu_config->shard_offset; // offset into the full parameter tensor
+    floatX* params_memory = (floatX*)model->params_memory;
+    floatX* grads_memory = (floatX*)model->grads_memory;
 
+    // lazily allocate m,v memory and master weights (usually on the first iteration)
     if (model->m_memory == NULL) {
-        printf0("allocating %zu MiB for AdamW optimizer state m\n", (num_parameters * sizeof(float)) >> 20);
-        printf0("allocating %zu MiB for AdamW optimizer state v\n", (num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**)&model->m_memory, num_parameters * sizeof(float)));
-        cudaCheck(cudaMalloc((void**)&model->v_memory, num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->m_memory, 0, num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, num_parameters * sizeof(float)));
-        if (model->use_master_weights == 1) {
-            printf0("allocating %zu MiB for master copy of params\n", (num_parameters * sizeof(float)) >> 20);
-            cudaCheck(cudaMalloc((void**)&model->master_weights, num_parameters * sizeof(float)));
-            copy_and_cast_kernel<<<CEIL_DIV(num_parameters, 512), 512>>>(model->master_weights, params_memory, num_parameters);
-            cudaCheck(cudaGetLastError());
-        }
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, shard_num_parameters * sizeof(float)));
+    }
+    if (model->use_master_weights == 1 && model->master_weights == NULL) {
+        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
+        size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
+        copy_and_cast_kernel<<<grid_size, 512>>>(model->master_weights, params_memory + shard_offset, shard_num_parameters);
+        cudaCheck(cudaGetLastError());
     }
 
     // gradient clipping
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
-    global_norm_squared(grad_norm_squared, (floatX*)model->grads_memory, model->num_parameters);
+    if (multi_gpu_config->zero_stage == 1) {
+        // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_grad_reduce,
+        // grads_memory only contains the averaged gradients at the local shard
+        // so we only calculate the grad norm at the grads_memory belonging to the local shard
+        global_norm_squared(grad_norm_squared, grads_memory + shard_offset, shard_num_parameters);
+    } else {
+        // the ncclAllReduce() in gpt2_multi_gpu_grad_reduce has averaged the gradients across all GPUs
+        // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
+        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters);
+    }
     // transfer the gradient norm to CPU
     float grad_norm_squared_cpu = 0.0f;
     cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+    if (multi_gpu_config->zero_stage == 1) {
+        // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
+        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+    }
+
     if(!isfinite(grad_norm_squared_cpu)) {
         // may happen due to some issue (e.g. overflow?)
         // TODO: later may want to keep a global counter of instabilities like this
@@ -2413,19 +1148,72 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
 
     // AdamW update
     int block_size = 512;
-    int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
-    adamw_kernel3<<<num_blocks, block_size>>>(params_memory, model->master_weights, grads_memory,
-                                              model->m_memory, model->v_memory, num_parameters,
-                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
-                                              grad_scale, seed);
+    // individually call the adamw_kernel3 on all parameter tensors separately
+    size_t offset = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        size_t num_parameters = model->param_elements[i];
+        // the scope of this GPU's work is the range: [shard_offset, shard_offset + shard_num_parameters)
+        // this parameter's values are in the range:  [offset, offset + num_parameters)
+        // so we are responsible for some of its parameters if:
+        // 1) this parameter ends after we begin (i.e. offset + num_parameters > shard_offset)
+        // 2) this parameter begins before we end (i.e. offset < shard_offset + shard_num_parameters)
+        if(offset + num_parameters > shard_offset && offset < shard_offset + shard_num_parameters) {
+
+            // ok this tensor has at least one element inside the range of responsibility of this GPU
+            // let's figure out the exact span we wish to call the AdamW kernel on
+            floatX* params_ptr = NULL;
+            floatX* grad_ptr = NULL;
+            float* m_ptr = NULL;
+            float* v_ptr = NULL;
+            float* master_ptr = NULL;
+            size_t local_params = 0;
+            // does the tensor begin before our responsibility?
+            if(offset <= shard_offset) {
+                // if so, our start point is exactly that of our responsibility, i.e. shard_offset
+                params_ptr = params_memory + shard_offset;
+                grad_ptr = grads_memory + shard_offset;
+                // note that (master_weights, m, v) are already only the "local slice" for this GPU,
+                // and are of size shard_num_parameters, instead of the total number of parameters
+                // so they do not get offset, i.e. we just start at their index 0
+                if (model->master_weights != NULL) { master_ptr = model->master_weights; }
+                m_ptr = model->m_memory;
+                v_ptr = model->v_memory;
+                // the number of parameters we have to update is the minimum of two ranges
+                local_params = min(shard_num_parameters, (offset + num_parameters) - shard_offset);
+            } else {
+                // our start point is the location of this tensor, i.e. offset
+                params_ptr = params_memory + offset;
+                grad_ptr = grads_memory + offset;
+                // this arithmetic gave me a headache but my little doodle example says it's right
+                size_t delta = offset - shard_offset;
+                if (model->master_weights != NULL) { master_ptr = model->master_weights + delta; }
+                m_ptr = model->m_memory + delta;
+                v_ptr = model->v_memory + delta;
+                local_params = min(num_parameters, shard_num_parameters - delta);
+            }
+            // we only want to weight decay the 2D tensors and leave all 1D tensors alone
+            // in particular this also decays the embedding weights, but this is ok:
+            // - the token embeddings are weight shared and participate in the final projection to logits
+            // - the position embeddings actively participate at every forward/backward pass
+            float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+            // ok finally call the kernel
+            size_t num_blocks = CEIL_DIV(local_params, block_size);
+            adamw_kernel3<<<num_blocks, block_size>>>(params_ptr, master_ptr, grad_ptr,
+                                                      m_ptr, v_ptr, local_params, learning_rate,
+                                                      beta1, beta2, beta1_correction, beta2_correction,
+                                                      eps, wd, grad_scale, seed);
+        }
+        // advance the offset pointer to the next parameter tensor
+        offset += num_parameters;
+    }
     cudaCheck(cudaGetLastError());
     return grad_norm_cpu;
 }
 
-void gpt2_multi_gpu_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
+void gpt2_multi_gpu_param_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
 {
 #ifdef MULTI_GPU
     if (multi_gpu_config->num_processes == 1) { return; } // 1 process => noop
@@ -2439,6 +1227,27 @@ void gpt2_multi_gpu_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
 #endif
 }
 
+float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
+    // estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS
+    // see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+    // TODO this calculation is only valid for an A100: generalize it?
+    int N = model->num_parameters;
+    int L = model->config.num_layers;
+    int H = model->config.num_heads;
+    int Q = model->config.channels / model->config.num_heads;
+    int T = model->seq_len;
+    size_t flops_per_token = (size_t)6 * N + (size_t)12 * L * H * Q * T;
+    size_t flops_per_step = flops_per_token * num_tokens;
+    // express our flops throughput as ratio of A100 bfloat16 peak flops
+    float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
+    float flops_promised = get_flops_promised(deviceProp.name, PRECISION_MODE) * 1e12f;
+    if(flops_promised < 0) {
+        return -1.f;   // don't know
+    }
+    float mfu = flops_achieved / flops_promised;
+    return mfu;
+}
+
 void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->params_memory));
     cudaCheck(cudaFree(model->grads_memory));
@@ -2449,19 +1258,25 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
-    cudaFreeHost(model->cpu_losses);
+    cudaCheck(cudaFreeHost(model->cpu_losses));
+    cudaCheck(cudaFreeHost(model->cpu_losses_fp32));
+    free(model->workload_indices);
+    free(model->bucket_info);
 }
 
 // ----------------------------------------------------------------------------
-// common init & free code for train/test/profile
+// common init & free code for all of train/test/profile
+
 void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
+
+    // get CUDA device infos
     cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx);
     if (print_device_info) {
         printf("[System]\n");
         printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name);
     }
 
-    // set up cuBLAS and cuBLASLt (and cuDNN if enabled)
+    // set up cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
@@ -2471,98 +1286,127 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     cublasCheck(cublasSetMathMode(cublas_handle, enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
     cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
+    #ifdef ENABLE_CUDNN
     create_cudnn();
+    #endif
 }
 
 void common_free(GPT2 &model) {
-    gpt2_free(&model);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
-    create_cudnn();
+    #ifdef ENABLE_CUDNN
+    destroy_cudnn();
+    #endif
 }
 
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
-// ----------------------------------------------------------------------------
-// sampler: takes probabilities and samples integers from them
-
-int sample_softmax(const float* logits, int n, float coin) {
-    // sample index from logits (converted to probabilities using softmax)
-    // coin is a random number in [0, 1), usually from random_f32()
-    double norm = 0;
-    for (int i = 0; i < n; i++) {
-        norm += expf(logits[i]);
-    }
-    // instead of dividing all exp(logits), we can just multiply coin.
-    coin *= norm;
-    float cdf = 0.0f;
-    for (int i = 0; i < n; i++) {
-        cdf += expf(logits[i]);
-        if (coin < cdf) {
-            return i;
-        }
-    }
-    return n - 1; // in case of rounding errors
-}
 
 // ----------------------------------------------------------------------------
-// Logger lite, will probably grow/change some over time
+// training resumption logic, very useful when jobs crash once in a while
+// the goal is that we can resume optimization from any checkpoint, bit-perfect
+// note that "state" refers to things not already saved in the model checkpoint file
 
-typedef struct {
-    FILE *logfile;
-    int flush_every; // every how many steps to flush the log
-} Logger;
-
-void logger_init(Logger *logger, const char *filename) {
-    logger->flush_every = 20;
-    logger->logfile = NULL;
-    if (filename != NULL) { logger->logfile = fopenCheck(filename, "w"); }
+void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
+    printf("Writing state to %s\n", filename);
+    FILE *state_file = fopenCheck(filename, "wb");
+    int state_header[256];
+    memset(state_header, 0, sizeof(state_header));
+    // basic identifying information
+    state_header[0] = 20240527; // magic number
+    state_header[1] = 1; // version number
+    state_header[2] = multi_gpu_config.num_processes; // number of processes
+    state_header[3] = multi_gpu_config.process_rank; // rank of this process
+    // int main state, start at 10 to leave some padding
+    state_header[10] = step; // step of the optimization
+    // model state, state, start at 20 to leave some padding
+    *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
+    // dataloader state, start at 30 to leave some padding
+    state_header[30] = loader->current_shard; // shard of the dataset
+    *((int64_t*)&state_header[31]) = loader->current_position; // position in shard
+    fwrite(state_header, sizeof(int), 256, state_file);
+    // write AdamW m, v, and master_weights here (they are all float)
+    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
+    float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
+    cudaCheck(cudaMemcpy(cpu_buffer, model->m_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
+    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    cudaCheck(cudaMemcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
+    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    free(cpu_buffer);
+    fclose(state_file);
 }
 
-void logger_log_val(Logger *logger, int step, float val_loss) {
-    if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d tel:%.4f\n", step, val_loss);
+void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
+    FILE *state_file = fopenCheck(filename, "rb");
+    int state_header[256];
+    freadCheck(state_header, sizeof(int), 256, state_file);
+    assert(state_header[0] == 20240527); // magic number
+    assert(state_header[1] == 1); // version number
+    assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
+    assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
+    *step = state_header[10]; // step of the optimization
+    model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
+    int current_shard = state_header[30]; // shard of the dataset
+    int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
+    dataloader_resume(loader, current_shard, current_position);
+    // read AdamW m, v (they are all float)
+    // also allocate the m, v memory in the model, if it does not yet exist
+    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
+    if (model->m_memory == NULL) {
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
     }
-}
-
-void logger_log_train(Logger *logger, int step, float train_loss) {
-    if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d trl:%.4f\n", step, train_loss);
-        if (step % 10 == 0) { fflush(logger->logfile); }
-    }
-}
-
-void logger_free(Logger *logger) {
-    if (logger->logfile != NULL) { fclose(logger->logfile); }
+    float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
+    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    cudaCheck(cudaMemcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    free(cpu_buffer);
+    fclose(state_file);
 }
 
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
+// unclaimed flags lol: k,p
 
 void error_usage() {
-    // default run = debugging run with TinyShakespeare
-    // bigger run = train on TinyStories! e.g. val/sample less often, but sample more tokens, write to logfile
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
-    fprintf(stderr, "Example: ./train_gpt2cu -i dev/data/tinystories/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <string> input dataset prefix (default = dev/data/tinyshakespeare/tiny_shakespeare)\n");
-    fprintf(stderr, "  -e <string> input model filename (default = gpt2_124M_bf16.bin)\n");
-    fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
+    // file system input / output
+    fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+    fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
+    fprintf(stderr, "  -e <string> input from model at this filename (default = gpt2_124M_bf16.bin)\n");
+    fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
+    fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
+    fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
+    // token layout for each step of the optimization
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
-    fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+    // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
+    // optimization
+    fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+    fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
+    fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
+    fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
+    // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
-    fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
+    fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
+    // debugging
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
+    // numerics
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
+    // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
-    fprintf(stderr, "  -r <int>    recompute: saves memory at cost of speed. (default = 1), 0 = none. 1 = recompute gelu\n");
+    fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2572,15 +1416,21 @@ int main(int argc, char *argv[]) {
     multi_gpu_config = multi_gpu_config_init(&argc, &argv);
 
     // read in the (optional) command line arguments
-    const char* input_dataset_prefix = "dev/data/tinyshakespeare/tiny_shakespeare"; // or e.g. data/TinyStories
+    const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
-    const char* output_log_file = NULL;
+    const char* output_log_dir = NULL;
+    int checkpoint_every = 0; // write optimization checkpoints every how many steps?
+    int resume = 0; // resume the optimization, if one is found inside output_log_dir?
     int B = 4; // batch size
     int T = 1024; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
+    int warmup_iterations = 0;
+    float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
+    float weight_decay = 0.0f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
-    int val_max_batches = 20; // how many batches max do we eval for validation loss?
+    int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
@@ -2589,47 +1439,76 @@ int main(int argc, char *argv[]) {
     int use_master_weights = 1;
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
-    float grad_clip  = 1.0f;
+    int hellaswag_eval = 0;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
-        if (argv[i][1] == 'i') { input_dataset_prefix = argv[i+1]; }
+        if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
-        else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
+        else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
+        else if (argv[i][1] == 'n') { checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
+        else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
+        else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'c') { grad_clip = atof(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
         else { error_usage(); }
     }
-    // calculate a sensible default for total batch size by assuming no gradient accumulation
-    if (total_batch_size == -1) { total_batch_size = B * T * multi_gpu_config.num_processes; }
+    // should do a bit more error checking here
+    assert(warmup_iterations >= 0);
+    if (output_log_dir != NULL) {
+        assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
+    }
+    // check if output_log_dir has a "." in it, because this behavior changed May 24, 2024. take out later
+    if (output_log_dir != NULL && strstr(output_log_dir, ".") != NULL) {
+        fprintf(stderr, "-o (output_log_dir) has a '.', are you specifying a file instead of dir?\n");
+        fprintf(stderr, "(note that this option changed recently, -o used to be file, became dir.)\n");
+        exit(EXIT_FAILURE);
+    }
+    int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
+    // calculate sensible default for total batch size as assuming no gradient accumulation
+    if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
+    // calculate the number of gradient accumulation steps from the desired total batch size
+    assert(total_batch_size % tokens_per_fwdbwd == 0);
+    int grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
+    // if we're only overfitting a single batch for debugging, let's overfit the first batch
+    // from val instead of train split, because val is smaller and faster. (train_gpt2.py does the same)
+    if (overfit_single_batch == 1) { train_data_pattern = val_data_pattern; }
     printf0("+-----------------------+----------------------------------------------------+\n");
     printf0("| Parameter             | Value                                              |\n");
     printf0("+-----------------------+----------------------------------------------------+\n");
-    printf0("| input dataset prefix  | %-50s |\n", input_dataset_prefix);
-    printf0("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
+    printf0("| train data pattern    | %-50s |\n", train_data_pattern);
+    printf0("| val data pattern      | %-50s |\n", val_data_pattern);
+    printf0("| output log dir        | %-50s |\n", output_log_dir == NULL ? "NULL" : output_log_dir);
+    printf0("| checkpoint_every      | %-50d |\n", checkpoint_every);
+    printf0("| resume                | %-50d |\n", resume);
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
-    printf0("| learning rate         | %-50e |\n", learning_rate);
-    printf0("| grad_clip             | %-50e |\n", grad_clip);
+    printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
+    printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
+    printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
+    printf0("| weight decay          | %-50e |\n", weight_decay);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
-    printf0("| val_max_batches       | %-50d |\n", val_max_batches);
+    printf0("| val_max_steps         | %-50d |\n", val_max_steps);
     printf0("| sample_every          | %-50d |\n", sample_every);
     printf0("| genT                  | %-50d |\n", genT);
     printf0("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
@@ -2638,21 +1517,50 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     common_start(override_enable_tf32, false); // common init code for train/test/profile
-
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
                               : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
-
     printf0("| device                | %-50s |\n", deviceProp.name);
+    printf0("| peak TFlops           | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
-    // build the GPT-2 model from a checkpoint
+    // figure out if we are going to be resuming the optimization
+    char filename_buffer[512];
+    int resuming = 0;
+    int resume_max_step = find_max_step(output_log_dir);
+    if (resume == 1) {
+        // find the DONE file with the highest step count
+        assert(output_log_dir != NULL);
+        if (resume_max_step == -1) {
+        } else {
+            resuming = 1;
+            snprintf(filename_buffer, 512, "%s/model_%08d.bin", output_log_dir, resume_max_step);
+        }
+    }
+
+    // build the GPT-2 model
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, load_filename);
+    // if load_filename is of the form "dX" where X is an integer (e.g. d12), then we build
+    // a random model with the depth of the model specified by X (e.g. 12). otherwise interpret
+    // this variable as a checkpoint filename, and load that checkpoint
+    assert(strlen(load_filename) >= 2);
+    if (resuming == 1) {
+        gpt2_build_from_checkpoint(&model, filename_buffer);
+    } else if (load_filename[0] == 'd') {
+        int depth = atoi(load_filename + 1);
+        if (depth > 1 && depth <= 1000) { // we're not going to train models this big right? heh
+            gpt2_build_from_random(&model, depth);
+        } else {
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        gpt2_build_from_checkpoint(&model, load_filename);
+    }
+
     model.use_master_weights = use_master_weights;
     model.recompute = recompute;
-    printf0("| load_filename         | %-50s |\n", load_filename);
+    printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : (load_filename[0] == 'd' ? "random" : "OpenAI's GPT-2 checkpoint"));
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf0("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
@@ -2663,20 +1571,38 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
-    char train_tokens_filename[128], val_tokens_filename[128];
-    assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
-    // if we're only overfitting a single batch for debugging, let's overfit the first batch
-    // from val instead of train split, because val is smaller and a bit faster
-    const char* train_split = (overfit_single_batch == 1) ? "val" : "train";
-    sprintf(train_tokens_filename, "%s_%s.bin", input_dataset_prefix, train_split);
-    sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_tokens_filename, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
-    dataloader_init(&val_loader, val_tokens_filename, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
-    int train_num_batches = (max_steps == -1) ? train_loader.num_batches : max_steps; // default = 1 epoch
-    int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    // figure out the number of training steps we will run for
+    int train_num_batches = max_steps; // passed in from command line
+    if (train_num_batches == -1) {
+        // sensible default is to train for exactly one epoch
+        size_t ntok = train_loader.num_tokens;
+        // the number of (outer loop) steps each process should take for us to reach one epoch
+        train_num_batches = ntok / total_batch_size;
+    }
+    // figure out the number of validation steps to run for
+    int val_num_batches = val_max_steps; // passed in from command line
+    if (val_num_batches == -1) {
+        // sensible default is to evaluate the full validation split
+        size_t ntok = val_loader.num_tokens;
+        // note that unlike the training loop, there is no gradient accumulation inner loop here
+        val_num_batches = ntok / tokens_per_fwdbwd;
+    }
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
+    printf0("+-----------------------+----------------------------------------------------+\n");
+
+    // build an EvalLoader for HellaSwag
+    EvalLoader eval_loader;
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char hellaswag_available = access(hellaswag_path, F_OK) == 0;
+    const char run_hellaswag = hellaswag_eval && hellaswag_available;
+    if (run_hellaswag) {
+        evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    }
+    printf0("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // pretty print in a table the multi-gpu configuration as well
@@ -2685,29 +1611,39 @@ int main(int argc, char *argv[]) {
     printf0("| zero_stage            | %-50d |\n", multi_gpu_config.zero_stage);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
+    // prints outside of pretty table to here and below
+    if (!hellaswag_available) {
+        printf0("HellaSwag eval not found at %s, skipping its evaluation\n", hellaswag_path);
+        printf0("You can run `python dev/data/hellaswag.py` to export and use it with `-h 1`.\n");
+    }
     // more prints related to allocations from gpt2_build_from_checkpoint down here to not mess up our table above
     printf0("num_parameters: %zu => bytes: %zu\n", model.num_parameters, model.num_parameters_bytes);
     printf0("allocated %d MiB for model parameters\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
-
-    // figure out gradient accumulation from the desired total batch size
-    int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
-    assert(total_batch_size % tokens_per_fwdbwd == 0);
-    int grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
+    // few more prints for gradient accumulation math up above
     printf0("batch_size B=%d * seq_len T=%d * num_processes=%d and total_batch_size=%d\n",
             B, T, multi_gpu_config.num_processes, total_batch_size);
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
 
-    // set up the Logger & Tokenizer
+    // set up logging
+    create_dir_if_not_exists(output_log_dir);
     Logger logger;
-    logger_init(&logger, output_log_file);
+    logger_init(&logger, output_log_dir, multi_gpu_config.process_rank, resume);
+
+    // set up the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
     // some memory for generating samples from the model
-    unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
     float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
+
+    // if we found a checkpoint to resume from, load the optimization state
+    int step = 0;
+    if (resuming == 1) {
+        snprintf(filename_buffer, 512, "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
+        load_state(&step, &model, &train_loader, filename_buffer);
+    }
 
     // train
     cudaEvent_t start, end;
@@ -2716,12 +1652,12 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
-    for (int step = 0; step <= train_num_batches; step++) {
+    for (; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
         int last_step = step == train_num_batches;
 
-        // once in a while estimate the validation loss
+        // once in a while estimate the validation loss (all processes collaborate)
         if (step % val_loss_every == 0 || last_step) {
             NvtxRange validation_range("validation");
             float val_loss = 0.0f;
@@ -2732,14 +1668,35 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            val_loss = multi_gpu_cpu_float_mean(val_loss, &multi_gpu_config);
+            val_loss = multi_gpu_cpu_float_sum(val_loss) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
 
-        // once in a while do model inference to print generated text
-        if (multi_gpu_config.process_rank == 0 && (step > 0 && (step % sample_every) == 0 || last_step)) {
+        // once in a while estimate HellaSwag accuracy (all processes collaborate)
+        if (run_hellaswag &&
+           ((step > 0 && step % val_loss_every == 0) || last_step)) {
+            NvtxRange evaluation_range("evaluation");
+            float eval_acc_norm = 0.0f;
+            evalloader_reset(&eval_loader);
+            for (int i = 0; i < eval_loader.num_batches; i++) {
+                if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
+                evalloader_next_batch(&eval_loader);
+                gpt2_forward(&model, eval_loader.inputs, eval_loader.targets, B, T);
+                int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses_fp32);
+                eval_acc_norm += (float)correct;
+            }
+            // careful because not all ranks may have the exact same allocation of number of examples
+            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
+            printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
+            logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
+        }
+
+        // once in a while do model inference to print generated text (only rank 0)
+        if (multi_gpu_config.process_rank == 0 && sample_every > 0 &&
+           (step > 0 && (step % sample_every) == 0 || last_step)) {
             NvtxRange generation_range("generation");
+            unsigned long long sample_rng_state = 1337;
             // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
             int eot_token = tokenizer.eot_token;
             for(int i = 0; i < B * T; ++i) {
@@ -2765,8 +1722,8 @@ int main(int argc, char *argv[]) {
                 for (int i = 0; i < model.config.vocab_size; i++) {
                     cpu_logits[i] = (float)cpu_logits_raw[i];
                 }
-
-                float coin = random_f32(&rng_state);
+                // sample the next token
+                float coin = random_f32(&sample_rng_state);
                 int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
                 // print the generated token, either using the Tokenizer or a fallback
@@ -2781,6 +1738,29 @@ int main(int argc, char *argv[]) {
             }
             printf("\n---\n");
         }
+
+        // once in a while checkpoint the optimization state (all ranks)
+        if ((checkpoint_every > 0 && output_log_dir != NULL && resuming == 0) &&
+            ((step > 0 && step % checkpoint_every == 0) || last_step)) {
+            assert(strlen(output_log_dir) < 400); // being a bit lazy here
+            // only rank 0 writes the model file because it is the same across all ranks
+            if (multi_gpu_config.process_rank == 0) {
+                snprintf(filename_buffer, 512, "%s/model_%08d.bin", output_log_dir, step);
+                gpt2_write_to_checkpoint(&model, filename_buffer);
+            }
+            // all ranks write their state file
+            snprintf(filename_buffer, 512, "%s/state_%08d_%05d.bin", output_log_dir, step, multi_gpu_config.process_rank);
+            save_state(filename_buffer, step, &model, &train_loader);
+            // DONE file is a signal that this checkpoint as a whole is complete
+            multi_gpu_barrier(&multi_gpu_config);
+            if (multi_gpu_config.process_rank == 0) {
+                snprintf(filename_buffer, 512, "%s/DONE_%08d", output_log_dir, step);
+                FILE* done_file = fopenCheck(filename_buffer, "w");
+                fclose(done_file);
+            }
+            multi_gpu_barrier(&multi_gpu_config);
+        }
+        resuming = 0;
 
         // bit confusing: we want to make sure to eval and sample on 0th iteration
         // but also after the very last iteration. so we loop for step <= train_num_batches
@@ -2804,18 +1784,31 @@ int main(int argc, char *argv[]) {
             gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps);
             lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward(&model);
+            gpt2_backward(&model, train_loader.inputs);
         }
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
         model.mean_loss = lossf;
         // update the parameters
-        gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
-        float grad_norm = gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, grad_clip, step+1, &multi_gpu_config);
-        gpt2_multi_gpu_gather(&model, &multi_gpu_config);
+        gpt2_multi_gpu_grad_reduce(&model, &multi_gpu_config);
+        // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
+        float step_learning_rate = learning_rate;
+        if (step < warmup_iterations) {
+            step_learning_rate = learning_rate * ((float)(step + 1)) / warmup_iterations;
+        } else {
+            float decay_ratio = ((float)(step - warmup_iterations)) / (train_num_batches - warmup_iterations);
+            assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
+            float coeff = 0.5f * (1.0f + cosf(M_PI * decay_ratio)); // coeff starts at 1 and goes to 0
+            assert(0.0f <= coeff && coeff <= 1.0f);
+            float min_lr = learning_rate * final_learning_rate_frac;
+            step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
+        }
+        // update the model parameters
+        float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
+        gpt2_multi_gpu_param_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
-        cudaEventRecord(end);
+        cudaCheck(cudaEventRecord(end));
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
         // --------------- TRAINING SECTION END -------------------
         // everything that follows now is just diagnostics, prints, logging, etc.
@@ -2824,18 +1817,19 @@ int main(int argc, char *argv[]) {
         float time_elapsed_ms;
         cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, start, end));
         size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
-        float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0;
+        float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0f;
         float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
         if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
-            total_sum_iteration_time_s += time_elapsed_ms / 1000.0;
+            total_sum_iteration_time_s += time_elapsed_ms / 1000.0f;
             // smooth out the tok/s with an exponential moving average, and bias correct just like in AdamW
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
-        printf0("step %4d/%d: train loss %f norm %.4f (%.2f ms, %.0f tok/s)\n",
-                step + 1, train_num_batches, accumulated_loss, grad_norm,
-                time_elapsed_ms, bias_corrected_ema_tokens_per_second);
+        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
+        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+                step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
+                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
 
         // disable the profiler after 3 steps of optimization
@@ -2847,15 +1841,15 @@ int main(int argc, char *argv[]) {
     // free and destroy everything
     cudaCheck(cudaEventDestroy(end));
     cudaCheck(cudaEventDestroy(start));
+    if (run_hellaswag) { evalloader_free(&eval_loader); }
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
     free(cpu_logits_raw);
     free(cpu_logits);
     free(gen_tokens);
-    logger_free(&logger);
     multi_gpu_config_free(&multi_gpu_config);
-
+    gpt2_free(&model);
     common_free(model);
     return 0;
 }
